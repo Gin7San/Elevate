@@ -2,17 +2,22 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
+import { getJwtSecret } from '../config.js';
 import { prisma } from '../lib/prisma.js';
 
 const router = Router();
+const optionalName = z.preprocess(
+  (value) => typeof value === 'string' && value.trim() === '' ? undefined : value,
+  z.string().trim().min(1).max(80).optional()
+);
 const credentialsSchema = z.object({
-  email: z.string().email(),
+  email: z.string().trim().email().max(254),
   password: z.string().min(8).max(72),
-  name: z.string().trim().min(1).max(80).optional()
-});
+  name: optionalName
+}).strict();
 
 function createToken(userId: string) {
-  return jwt.sign({}, process.env.JWT_SECRET ?? 'development-secret', {
+  return jwt.sign({}, getJwtSecret(), {
     subject: userId,
     expiresIn: '7d'
   });
@@ -32,14 +37,22 @@ router.post('/register', async (req, res) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const user = await prisma.user.create({
-    data: { email: normalizedEmail, passwordHash, name }
-  });
+  try {
+    const user = await prisma.user.create({
+      data: { email: normalizedEmail, passwordHash, name }
+    });
 
-  return res.status(201).json({
-    token: createToken(user.id),
-    user: { id: user.id, email: user.email, name: user.name }
-  });
+    return res.status(201).json({
+      token: createToken(user.id),
+      user: { id: user.id, email: user.email, name: user.name }
+    });
+  } catch (error) {
+    // A concurrent registration can pass the lookup above; preserve the API's 409 contract.
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+    throw error;
+  }
 });
 
 router.post('/login', async (req, res) => {

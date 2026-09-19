@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, arena/01a0ba16-elevate]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: InterviewSense
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            InterviewSense/package-lock.json
+            InterviewSense/backend/package-lock.json
+            InterviewSense/frontend/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix backend
+      - run: npm ci --prefix frontend
+      - run: npm run prisma --prefix backend -- generate
+      - run: npm run check
+      - run: npm audit --omit=dev --audit-level=high --prefix backend
+      - run: npm audit --omit=dev --audit-level=high --prefix frontend

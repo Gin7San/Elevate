@@ -1,14 +1,18 @@
+import { z } from 'zod';
+
 function clamp(value: number) { return Math.max(0, Math.min(100, Math.round(value))); }
 
-export type VoiceMetrics = {
-  durationMs: number;
-  averageRms: number;
-  energyStd: number;
-  silenceRatio: number;
-  longPauseCount: number;
-  zeroCrossingMean: number;
-  zeroCrossingStd: number;
-};
+export const voiceMetricsSchema = z.object({
+  durationMs: z.number().int().positive().max(100 * 60 * 1000),
+  averageRms: z.number().finite().min(0).max(1),
+  energyStd: z.number().finite().min(0).max(1),
+  silenceRatio: z.number().finite().min(0).max(1),
+  longPauseCount: z.number().int().min(0).max(1000),
+  zeroCrossingMean: z.number().finite().min(0).max(1),
+  zeroCrossingStd: z.number().finite().min(0).max(1)
+}).strict();
+
+export type VoiceMetrics = z.infer<typeof voiceMetricsSchema>;
 
 export function analyzeVoice(metrics: VoiceMetrics) {
   // These are MVP heuristics and should be calibrated with pilot recordings.
@@ -21,6 +25,10 @@ export function analyzeVoice(metrics: VoiceMetrics) {
   return {
     category: 'VOICE_DELIVERY', score,
     metrics: { ...metrics, energyScore, consistencyScore, pitchVariationScore, pauseScore },
-    limitations: ['Volume depends on microphone distance and hardware.', 'Pitch is estimated using zero-crossing variation in this MVP.']
+    limitations: [
+      'Volume depends on microphone distance and hardware.',
+      'Pitch is estimated using zero-crossing variation in this MVP.',
+      'Metrics are calculated in the browser and should not be treated as tamper-proof.'
+    ]
   };
 }
