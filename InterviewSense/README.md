@@ -98,11 +98,12 @@ npm run check     # build and test
 ## Security and storage notes
 
 - Authentication endpoints hash passwords with bcrypt and issue seven-day JWTs.
+- Password reset uses `POST /api/v1/auth/forgot-password` to create a one-hour, hashed single-use token and `POST /api/v1/auth/reset-password` to set a new password. Tokens are hashed with SHA-256 and cleared after use or expiry.
 - The API refuses to start with a missing, short, or known-placeholder JWT secret.
 - Recording uploads are authenticated, MIME-filtered, and limited to 25 MB.
 - Development recordings are stored in `backend/uploads` and are ignored by Git.
 - Production deployments should use private object storage, authenticated media delivery, HTTPS, rate limiting, and managed secrets.
-- Tokens are currently stored in browser local storage. A hardened public deployment should move authentication to secure, HTTP-only cookies with CSRF protection.
+- Tokens are currently stored in browser local storage. A hardened public deployment should move authentication to secure, HTTP-only cookies with CSRF protection and deliver reset tokens via email.
 
 ## Database changes
 
