@@ -5,6 +5,9 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { getJwtSecret } from '../config.js';
 import { prisma } from '../lib/prisma.js';
+import { createRateLimiter } from '../lib/rateLimit.js';
+import { clearAuthCookies, setAuthCookies } from '../lib/cookies.js';
+import { isMailConfigured, sendPasswordResetEmail } from '../services/mailer.js';
 
 const router = Router();
 const optionalName = z.preprocess(
@@ -26,6 +29,10 @@ const resetPasswordSchema = z.object({
   password: z.string().min(8).max(72)
 }).strict();
 
+// Throttle reset requests: 10 per 15 minutes per client IP, 3 per hour per account.
+const forgotPasswordIpLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, namespace: 'forgot-ip' });
+const forgotPasswordEmailLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 3, namespace: 'forgot-email' });
+
 function createToken(userId: string) {
   return jwt.sign({}, getJwtSecret(), {
     subject: userId,
@@ -35,6 +42,21 @@ function createToken(userId: string) {
 
 function hashToken(token: string) {
   return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function issueSession(res: Parameters<typeof setAuthCookies>[0], userId: string) {
+  const token = createToken(userId);
+  const csrfToken = crypto.randomBytes(32).toString('hex');
+  setAuthCookies(res, token, csrfToken);
+  return { token, csrfToken };
+}
+
+function resetUrlFor(token: string): string {
+  const origin = (process.env.CLIENT_URL ?? 'http://localhost:5173')
+    .split(',')[0]
+    .trim()
+    .replace(/\/$/, '') || 'http://localhost:5173';
+  return `${origin}/?token=${token}`;
 }
 
 router.post('/register', async (req, res) => {
@@ -56,8 +78,9 @@ router.post('/register', async (req, res) => {
       data: { email: normalizedEmail, passwordHash, name }
     });
 
+    const session = issueSession(res, user.id);
     return res.status(201).json({
-      token: createToken(user.id),
+      ...session,
       user: { id: user.id, email: user.email, name: user.name }
     });
   } catch (error) {
@@ -81,10 +104,16 @@ router.post('/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
+  const session = issueSession(res, user.id);
   return res.json({
-    token: createToken(user.id),
+    ...session,
     user: { id: user.id, email: user.email, name: user.name }
   });
+});
+
+router.post('/logout', (_req, res) => {
+  clearAuthCookies(res);
+  return res.status(204).end();
 });
 
 router.post('/forgot-password', async (req, res) => {
@@ -94,6 +123,14 @@ router.post('/forgot-password', async (req, res) => {
   }
 
   const normalizedEmail = parsed.data.email.toLowerCase();
+  const ipResult = forgotPasswordIpLimiter.hit(req.ip ?? 'unknown');
+  const emailResult = forgotPasswordEmailLimiter.hit(normalizedEmail);
+  if (!ipResult.allowed || !emailResult.allowed) {
+    const retryAfter = Math.max(ipResult.retryAfterSeconds, emailResult.retryAfterSeconds);
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'Too many password reset attempts. Please try again later.' });
+  }
+
   const user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
 
   // Always return the same message to prevent account enumeration.
@@ -115,11 +152,24 @@ router.post('/forgot-password', async (req, res) => {
     }
   });
 
-  // In production this token would be emailed. Exposed here for development/testing.
+  if (isMailConfigured()) {
+    try {
+      await sendPasswordResetEmail(normalizedEmail, resetUrlFor(resetToken));
+    } catch (error) {
+      // Never fall back to exposing the token over the API when mail delivery
+      // is expected; log the failure so operators can fix SMTP.
+      console.error('Failed to send password reset email:', error);
+    }
+    return res.json({ message: genericMessage });
+  }
+
+  // Development fallback: without SMTP_URL the token is returned in the
+  // response so local development and tests can exercise the reset flow.
   return res.json({
     message: genericMessage,
     resetToken,
-    expiresAt: expires.toISOString()
+    expiresAt: expires.toISOString(),
+    note: 'SMTP_URL is not configured; the reset token is exposed for development use only.'
   });
 });
 
@@ -128,7 +178,6 @@ router.post('/reset-password', async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: 'Token and password are required', details: parsed.error.flatten() });
   }
-
   const tokenHash = hashToken(parsed.data.token);
 
   const user = await prisma.user.findFirst({

@@ -6,9 +6,29 @@ type User = { id: string; email: string; name: string | null };
 type Analysis = { id: string; kind: string; score: number | null; details: { metrics?: Record<string, number | null> } | null };
 type Question = { id: string; text: string; order: number; answer: { transcript: string; mediaUrl?: string | null; durationMs?: number | null; analyses?: Analysis[] } | null };
 type Interview = { id: string; title: string; role: string | null; status: string; createdAt: string; _count?: { questions: number }; report: { overallScore: number | null } | null; questions?: Question[] };
-type AuthResponse = { token: string; user: User };
+type AuthResponse = { user: User; token?: string; csrfToken?: string };
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ?? '/api/v1';
 const MEDIA_URL = (import.meta.env.VITE_MEDIA_URL as string | undefined)?.replace(/\/$/, '') ?? '';
+const CSRF_COOKIE = 'interviewsense_csrf';
+
+function getCookieValue(name: string): string {
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : '';
+}
+
+/**
+ * Session lives in an HttpOnly cookie set by the API. Unsafe requests echo the
+ * readable CSRF cookie back in a header (double-submit protection).
+ */
+function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const method = (init.method ?? 'GET').toUpperCase();
+  const headers = new Headers(init.headers);
+  if (method !== 'GET' && method !== 'HEAD') {
+    const csrfToken = getCookieValue(CSRF_COOKIE);
+    if (csrfToken) headers.set('X-CSRF-Token', csrfToken);
+  }
+  return fetch(input, { credentials: 'include', ...init, headers });
+}
 
 function App() {
   const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
@@ -36,15 +56,12 @@ function App() {
   const [forgotResult, setForgotResult] = useState<{ message: string; resetToken?: string } | null>(null);
   const [resetToken, setResetToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
-  const token = localStorage.getItem('interviewsense_token');
-
   useEffect(() => {
-    if (!token) return;
-    fetch(`${API_URL}/me`, { headers: { Authorization: `Bearer ${token}` } })
+    authFetch(`${API_URL}/me`)
       .then(async (r) => (r.ok ? r.json() : Promise.reject()))
       .then((d) => setUser(d.user))
-      .catch(() => localStorage.removeItem('interviewsense_token'));
-  }, [token]);
+      .catch(() => setUser(null));
+  }, []);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -63,12 +80,12 @@ function App() {
   }, [recording]);
 
   useEffect(() => {
-    if (!user || !token) return;
-    fetch(`${API_URL}/interviews`, { headers: { Authorization: `Bearer ${token}` } })
+    if (!user) return;
+    authFetch(`${API_URL}/interviews`)
       .then((r) => r.json())
       .then((d) => setInterviews(d.interviews ?? []))
       .catch(() => setError('Could not load your interviews.'));
-  }, [user, token]);
+  }, [user]);
 
   useEffect(() => () => {
     if (recordedUrl.startsWith('blob:')) URL.revokeObjectURL(recordedUrl);
@@ -82,14 +99,14 @@ function App() {
     setInfo('');
     setLoading(true);
     try {
-      const r = await fetch(`${API_URL}/auth/${mode}`, {
+      const r = await authFetch(`${API_URL}/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(mode === 'register' ? form : { email: form.email, password: form.password })
       });
       const d = (await r.json()) as AuthResponse & { error?: string };
       if (!r.ok) throw new Error(d.error ?? 'Something went wrong');
-      localStorage.setItem('interviewsense_token', d.token);
+      // Server sets the HttpOnly session cookie; nothing is stored in JS.
       setUser(d.user);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to connect to the API');
@@ -105,7 +122,7 @@ function App() {
     setForgotResult(null);
     setLoading(true);
     try {
-      const r = await fetch(`${API_URL}/auth/forgot-password`, {
+      const r = await authFetch(`${API_URL}/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: forgotEmail })
@@ -130,7 +147,7 @@ function App() {
     setInfo('');
     setLoading(true);
     try {
-      const r = await fetch(`${API_URL}/auth/reset-password`, {
+      const r = await authFetch(`${API_URL}/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: resetToken, password: newPassword })
@@ -154,9 +171,9 @@ function App() {
     setError('');
     setLoading(true);
     try {
-      const r = await fetch(`${API_URL}/interviews`, {
+      const r = await authFetch(`${API_URL}/interviews`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(interviewForm)
       });
       const d = await r.json();
@@ -174,7 +191,7 @@ function App() {
 
   async function openInterview(interview: Interview) {
     setError('');
-    const r = await fetch(`${API_URL}/interviews/${interview.id}`, { headers: { Authorization: `Bearer ${token}` } });
+    const r = await authFetch(`${API_URL}/interviews/${interview.id}`);
     const d = await r.json();
     if (!r.ok) return setError(d.error ?? 'Could not load interview');
     setSelected(d.interview);
@@ -255,9 +272,8 @@ function App() {
         setError('The recording could not be analyzed. The text answer will still be saved.');
       }
     }
-    const r = await fetch(`${API_URL}/interviews/${selected.id}/answers`, {
+    const r = await authFetch(`${API_URL}/interviews/${selected.id}/answers`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
       body: payload
     });
     if (!r.ok) {
@@ -299,9 +315,8 @@ function App() {
       setRecordedBlob(null);
       setRecordingDuration(selected.questions[next].answer?.durationMs ?? 0);
     } else {
-      const r = await fetch(`${API_URL}/interviews/${selected.id}/complete`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
+      const r = await authFetch(`${API_URL}/interviews/${selected.id}/complete`, {
+        method: 'POST'
       });
       const data = await r.json();
       if (!r.ok) {
@@ -354,9 +369,8 @@ function App() {
     const payload = new FormData();
     payload.append('media', recordedBlob, 'answer.webm');
     try {
-      const r = await fetch(`${API_URL}/transcription`, {
+      const r = await authFetch(`${API_URL}/transcription`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
         body: payload
       });
       const data = await r.json();
@@ -375,9 +389,13 @@ function App() {
     setSelected(null);
   }
 
-  function logout() {
+  async function logout() {
     stopRecording();
-    localStorage.removeItem('interviewsense_token');
+    try {
+      await authFetch(`${API_URL}/auth/logout`, { method: 'POST' });
+    } catch {
+      // Cookie cleanup is best-effort; local state is cleared either way.
+    }
     setUser(null);
     setInterviews([]);
     setSelected(null);

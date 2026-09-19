@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
+import { toSignedMediaUrl } from '../lib/mediaSign.js';
 import { analyzeSpeech } from '../services/confidence.js';
 import { analyzeVoice, voiceMetricsSchema } from '../services/voice.js';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth.js';
@@ -167,7 +168,7 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
       await removeUpload(question.answer.mediaUrl);
     }
     return res.json({
-      answer: result.answer,
+      answer: { ...result.answer, mediaUrl: toSignedMediaUrl(result.answer.mediaUrl) },
       speechAnalysis: { ...speechAnalysis, kind: speechAnalysis.category },
       voiceAnalysis: voiceAnalysis ? { ...voiceAnalysis, kind: voiceAnalysis.category } : null,
       analysisIds: result.analyses.map((item: { id: string }) => item.id)
@@ -244,7 +245,14 @@ router.get('/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
     }
   });
   if (!interview) return res.status(404).json({ error: 'Interview not found' });
-  return res.json({ interview });
+  // Media is private: exchange stored upload paths for short-lived signed URLs.
+  const questions = interview.questions.map((question) => ({
+    ...question,
+    answer: question.answer
+      ? { ...question.answer, mediaUrl: toSignedMediaUrl(question.answer.mediaUrl) }
+      : null
+  }));
+  return res.json({ interview: { ...interview, questions } });
 });
 
 export default router;

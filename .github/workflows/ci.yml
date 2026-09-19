@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, arena/01a0ba16-elevate]
+    branches: [main, arena/01a0baa9-elevate]
   pull_request:
 
 permissions:
