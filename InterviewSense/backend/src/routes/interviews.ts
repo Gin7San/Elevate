@@ -5,8 +5,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
+import { toSignedMediaUrl } from '../lib/mediaSign.js';
 import { analyzeSpeech } from '../services/confidence.js';
 import { analyzeVoice, voiceMetricsSchema } from '../services/voice.js';
+import { pauseAnalysisSchema } from '../services/transcription.js';
+import { generateReportSummary } from '../services/report.js';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
@@ -19,7 +22,8 @@ const acceptedMediaTypes = new Set([
 ]);
 const upload = multer({
   dest: uploadsPath,
-  limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 4, parts: 5 },
+  // questionId, transcript, durationMs, voiceMetrics, pauseAnalysis + margin
+  limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 6, parts: 8 },
   fileFilter: (_req, file, callback) => {
     if (acceptedMediaTypes.has(file.mimetype)) callback(null, true);
     else callback(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'media'));
@@ -38,7 +42,8 @@ const answerSchema = z.object({
   questionId: z.string().min(1),
   transcript: z.string().trim().min(1).max(10000),
   durationMs: z.number().int().positive().max(100 * 60 * 1000).optional(),
-  voiceMetrics: z.string().max(4000).optional()
+  voiceMetrics: z.string().max(4000).optional(),
+  pauseAnalysis: z.string().max(2500).optional()
 }).strict();
 
 function questionsForRole(role?: string) {
@@ -56,6 +61,30 @@ async function removeUpload(mediaUrl?: string | null) {
   if (!mediaUrl?.startsWith('/uploads/')) return;
   const filename = path.basename(mediaUrl);
   await fs.rm(path.join(uploadsPath, filename), { force: true }).catch(() => undefined);
+}
+
+/**
+ * Loads a session's questions with their answers and analyses using flat
+ * one-level includes plus an in-memory join. Three-level nested includes hit
+ * a serialization bug in the early Rust-free Prisma client (6.7.0), and this
+ * reads identically under the classic engine while costing at most two extra
+ * round-trips for a bounded number of questions per session.
+ */
+async function loadSessionQuestions(sessionId: string) {
+  const questions = await prisma.question.findMany({
+    where: { sessionId },
+    orderBy: { order: 'asc' },
+    include: { answer: true }
+  });
+  const answers = await prisma.answer.findMany({
+    where: { questionId: { in: questions.map((question) => question.id) } },
+    include: { analyses: true }
+  });
+  const byQuestionId = new Map(answers.map((answer) => [answer.questionId, answer]));
+  return questions.map(({ answer: _answer, ...question }) => ({
+    ...question,
+    answer: byQuestionId.get(question.id) ?? null
+  }));
 }
 
 router.get('/', requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -118,6 +147,16 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
     }
   }
 
+  let pauseAnalysis: z.infer<typeof pauseAnalysisSchema> | undefined;
+  if (parsed.data.pauseAnalysis) {
+    try {
+      pauseAnalysis = pauseAnalysisSchema.parse(JSON.parse(parsed.data.pauseAnalysis));
+    } catch {
+      await removeUpload(newMediaUrl);
+      return res.status(400).json({ error: 'Pause analysis data is invalid' });
+    }
+  }
+
   const question = await prisma.question.findFirst({
     where: { id: parsed.data.questionId, sessionId: req.params.id, session: { userId: req.userId } },
     include: { answer: { select: { mediaUrl: true } } }
@@ -127,7 +166,7 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
     return res.status(404).json({ error: 'Question not found' });
   }
 
-  const speechAnalysis = analyzeSpeech(parsed.data.transcript, parsed.data.durationMs);
+  const speechAnalysis = analyzeSpeech(parsed.data.transcript, parsed.data.durationMs, pauseAnalysis);
   try {
     const result = await prisma.$transaction(async (tx: Pick<typeof prisma, 'answer' | 'analysisResult'>) => {
       const answer = await tx.answer.upsert({
@@ -167,7 +206,7 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
       await removeUpload(question.answer.mediaUrl);
     }
     return res.json({
-      answer: result.answer,
+      answer: { ...result.answer, mediaUrl: toSignedMediaUrl(result.answer.mediaUrl) },
       speechAnalysis: { ...speechAnalysis, kind: speechAnalysis.category },
       voiceAnalysis: voiceAnalysis ? { ...voiceAnalysis, kind: voiceAnalysis.category } : null,
       analysisIds: result.analyses.map((item: { id: string }) => item.id)
@@ -181,12 +220,12 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
 router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (!req.userId) return res.status(401).json({ error: 'Authentication required' });
   const interview = await prisma.interviewSession.findFirst({
-    where: { id: req.params.id, userId: req.userId },
-    include: { questions: { include: { answer: { include: { analyses: true } } } } }
+    where: { id: req.params.id, userId: req.userId }
   });
   if (!interview) return res.status(404).json({ error: 'Interview not found' });
+  const questions = await loadSessionQuestions(interview.id);
 
-  const unanswered = interview.questions.filter((question: { answer: unknown }) => !question.answer);
+  const unanswered = questions.filter((question) => !question.answer);
   if (unanswered.length > 0) {
     return res.status(409).json({
       error: 'Answer every question before completing the interview',
@@ -194,12 +233,32 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
     });
   }
 
-  const scores: number[] = interview.questions.flatMap((question: { answer: { analyses: Array<{ score: number | null }> } | null }) =>
-    question.answer?.analyses.flatMap((analysis: { score: number | null }) => analysis.score ?? []) ?? []
+  const scores: number[] = questions.flatMap((question) =>
+    question.answer?.analyses.flatMap((analysis) => analysis.score ?? []) ?? []
   );
   const overallScore = scores.length > 0
     ? Math.round(scores.reduce((total, score) => total + score, 0) / scores.length)
     : null;
+
+  // Narrative feedback: LLM-generated when configured, deterministic offline
+  // summary otherwise (never blocks completing an interview).
+  const digest = questions.map((question) => ({
+    text: question.text,
+    transcript: question.answer?.transcript ?? null,
+    analyses: (question.answer?.analyses ?? []).map((analysis) => ({
+      kind: analysis.kind,
+      score: analysis.score,
+      metrics: (analysis.details as { metrics?: Record<string, unknown> } | null)?.metrics ?? null
+    }))
+  }));
+  const reportSummary = await generateReportSummary(digest, overallScore);
+  const reportDetails = {
+    answeredQuestions: questions.length,
+    analysisCount: scores.length,
+    strengths: reportSummary.strengths,
+    improvements: reportSummary.improvements,
+    usedLlm: reportSummary.usedLlm
+  };
 
   const { completed, report } = await prisma.$transaction(async (tx: Pick<typeof prisma, 'interviewSession' | 'feedbackReport'>) => {
     const completed = await tx.interviewSession.update({
@@ -208,17 +267,8 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
     });
     const report = await tx.feedbackReport.upsert({
       where: { sessionId: interview.id },
-      update: {
-        overallScore,
-        summary: overallScore === null ? 'Interview completed.' : `Overall confidence score: ${overallScore}/100.`,
-        details: { answeredQuestions: interview.questions.length, analysisCount: scores.length }
-      },
-      create: {
-        sessionId: interview.id,
-        overallScore,
-        summary: overallScore === null ? 'Interview completed.' : `Overall confidence score: ${overallScore}/100.`,
-        details: { answeredQuestions: interview.questions.length, analysisCount: scores.length }
-      }
+      update: { overallScore, summary: reportSummary.summary, details: reportDetails },
+      create: { sessionId: interview.id, overallScore, summary: reportSummary.summary, details: reportDetails }
     });
     return { completed, report };
   });
@@ -226,8 +276,8 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
   return res.json({
     interview: completed,
     report,
-    answeredQuestions: interview.questions.length,
-    totalQuestions: interview.questions.length
+    answeredQuestions: questions.length,
+    totalQuestions: questions.length
   });
 });
 
@@ -235,16 +285,18 @@ router.get('/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (!req.userId) return res.status(401).json({ error: 'Authentication required' });
   const interview = await prisma.interviewSession.findFirst({
     where: { id: req.params.id, userId: req.userId },
-    include: {
-      questions: {
-        orderBy: { order: 'asc' },
-        include: { answer: { include: { analyses: true } } }
-      },
-      report: true
-    }
+    include: { report: true }
   });
   if (!interview) return res.status(404).json({ error: 'Interview not found' });
-  return res.json({ interview });
+  const questions = await loadSessionQuestions(interview.id);
+  // Media is private: exchange stored upload paths for short-lived signed URLs.
+  const signedQuestions = questions.map((question) => ({
+    ...question,
+    answer: question.answer
+      ? { ...question.answer, mediaUrl: toSignedMediaUrl(question.answer.mediaUrl) }
+      : null
+  }));
+  return res.json({ interview: { ...interview, questions: signedQuestions } });
 });
 
 export default router;
