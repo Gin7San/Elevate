@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
+import { getJwtSecret } from '../config.js';
 
 export type AuthenticatedRequest = Request & { userId?: string };
 
@@ -12,7 +13,7 @@ export function requireAuth(req: AuthenticatedRequest, res: Response, next: Next
   }
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET ?? 'development-secret');
+    const payload = jwt.verify(token, getJwtSecret());
     if (typeof payload === 'string' || !payload.sub) {
       return res.status(401).json({ error: 'Invalid authentication token' });
     }

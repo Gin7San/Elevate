@@ -6,25 +6,27 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "prisma": "prisma"
+    "prisma": "prisma",
+    "test": "node --import tsx --test src/services/*.test.ts",
+    "check": "npm run build && npm test"
   },
   "dependencies": {
     "@prisma/client": "6.7.0",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
-    "jsonwebtoken": "^9.0.2",
-    "multer": "^2.0.0",
-    "openai": "^5.12.2",
     "dotenv": "^16.5.0",
-    "express": "^5.1.0",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.4.0",
+    "openai": "^5.12.2",
     "zod": "^3.24.3"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.1",
     "@types/jsonwebtoken": "^9.0.9",
-    "@types/node": "^22.15.3",
     "@types/multer": "^2.0.0",
+    "@types/node": "^22.15.3",
     "prisma": "6.7.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"

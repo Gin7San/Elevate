@@ -68,7 +68,7 @@ model AnalysisResult {
   details   Json?
   createdAt DateTime @default(now())
   answer    Answer   @relation(fields: [answerId], references: [id], onDelete: Cascade)
-  @@index([answerId, kind])
+  @@unique([answerId, kind])
 }
 
 model FeedbackReport {
