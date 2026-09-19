@@ -7,19 +7,25 @@ AI-powered mock interviews with recording, transcription, and multimodal confide
 - Frontend: React, TypeScript, Vite
 - Backend: Node.js, Express, TypeScript
 - Database: PostgreSQL with Prisma
-- Transcription: OpenAI Whisper API
-- Analysis: speech-fluency and browser-derived voice-delivery heuristics
+- Transcription: OpenAI Whisper API with word-level timestamps
+- Analysis: speech-fluency scoring driven by real pause metrics (from timestamped transcription), browser-derived voice-delivery scoring with tunable calibration, and narrative feedback reports (LLM-written when configured, deterministic offline otherwise)
 
-> Voice scores are coaching heuristics, not clinical or hiring assessments. Browser-derived metrics are validated by the API but are not tamper-proof.
+> Scores are coaching heuristics, not clinical or hiring assessments. Browser-derived metrics are validated by the API but are not tamper-proof.
+
+## Analysis pipeline
+
+1. **Timestamped transcription.** `POST /api/v1/transcription` calls Whisper with `response_format: verbose_json` and `timestamp_granularities: ['word']`. The response includes a server-derived pause analysis (pause count, long pauses ≥ 2 s, total/longest pause durations, spoken-span speaking rate). The SPA attaches it to the answer, so `confidence.ts` computes fluency from filler rate **and** real pauses; without it, the response explicitly lists that limitation in `AnalysisResult.details.limitations`.
+2. **Voice delivery calibration.** `voice.ts` scores energy, consistency, pitch variation, and pause behavior against named calibration targets (`VOICE_CALIBRATION_DEFAULTS`). Calibration protocol: record 20–30 pilot sessions with at least two microphone setups, have 2+ reviewers rate perceived delivery confidence, then adjust the targets — deployed values can be overridden without redeploys via `VOICE_CALIBRATION_JSON` (validated against a strict schema). Metrics and limitations are stored in `AnalysisResult.details` and surfaced in the UI under each answer's analysis panel.
+3. **Report generation.** `POST /api/v1/interviews/:id/complete` scores the interview and builds a `FeedbackReport` with a narrative `summary`, `strengths`, and `improvements`. With `OPENAI_API_KEY` set (model via `OPENAI_REPORT_MODEL`, default `gpt-4o-mini`) the summary is LLM-written; otherwise a deterministic offline summary is derived from the recorded analyses. The UI renders the report on the completed interview screen and the score on the dashboard history.
 
 ## Local setup
 
 Requirements: Node.js 22+, npm, Docker, and Docker Compose.
 
-1. Start PostgreSQL:
+1. Start PostgreSQL (only the database service; run the apps natively for development):
 
    ```bash
-   docker compose up -d
+   docker compose up -d postgres
    ```
 
 2. Install dependencies:
@@ -73,7 +79,10 @@ The Vite development server proxies `/api` and `/uploads` to the backend, so bro
 | `JWT_SECRET` | Yes | Unique secret of at least 32 characters; also signs media URLs |
 | `PORT` | No | API port; defaults to `4000` |
 | `CLIENT_URL` | No | Comma-separated allowed browser origins; defaults to `http://localhost:5173` |
-| `OPENAI_API_KEY` | No | Enables Whisper transcription |
+| `OPENAI_API_KEY` | No | Enables Whisper transcription and LLM-written report summaries |
+| `OPENAI_TRANSCRIBE_MODEL` | No | Whisper model name; defaults to `whisper-1` |
+| `OPENAI_REPORT_MODEL` | No | Chat model for report summaries; defaults to `gpt-4o-mini` |
+| `VOICE_CALIBRATION_JSON` | No | JSON overrides for voice scoring calibration targets |
 | `SMTP_URL` | No | SMTP connection string; enables email delivery of password-reset links |
 | `SMTP_FROM` | No | Sender address for reset emails |
 | `COOKIE_SECURE` | No | Force `Secure` cookies on/off; defaults to Secure only when `NODE_ENV=production` |
@@ -95,9 +104,24 @@ From `InterviewSense/`:
 ```bash
 npm run dev       # run frontend and backend in development
 npm run build     # build both applications
-npm test          # run backend unit tests
-npm run check     # build and test
+npm test          # backend unit tests (services and lib, no database needed)
+npm run test:e2e  # e2e route tests (needs DATABASE_URL with migrations applied)
+npm run check     # build and unit tests
 ```
+
+The e2e suite covers auth, CSRF, the interview/analysis pipeline, signed media
+delivery, and password reset against a real PostgreSQL database. In CI it runs
+against a postgres service container after `prisma migrate deploy`.
+
+## Full stack with Docker
+
+For development, start only PostgreSQL (`docker compose up -d postgres`) and run the apps natively as above. To run everything containerized:
+
+```bash
+JWT_SECRET=$(openssl rand -base64 48) docker compose up --build
+```
+
+The compose stack builds production images for the backend (applies migrations on boot) and the frontend (nginx serving the SPA and proxying `/api` to the backend). The app is then available at <http://localhost:8080>. Set `OPENAI_API_KEY`/`SMTP_URL` in the environment to enable transcription/report emails there too.
 
 ## Security and storage notes
 

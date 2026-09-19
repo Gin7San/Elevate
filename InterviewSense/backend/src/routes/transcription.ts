@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import multer from 'multer';
-import OpenAI, { toFile } from 'openai';
 import { requireAuth } from '../middleware/auth.js';
+import { isTranscriptionConfigured, transcribeWithWhisper } from '../services/transcription.js';
 
 const router = Router();
 const acceptedMediaTypes = new Set([
@@ -17,17 +17,24 @@ const upload = multer({
   }
 });
 
+/**
+ * Transcribes a recording with word-level timestamps. The response includes a
+ * server-derived pause analysis which the SPA attaches to its answer so the
+ * fluency scoring runs on real pauses instead of filler-rate alone.
+ */
 router.post('/', requireAuth, upload.single('media'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'A recording is required' });
-  if (!process.env.OPENAI_API_KEY) {
+  if (!isTranscriptionConfigured()) {
     return res.status(503).json({ error: 'Speech transcription is not configured. Add OPENAI_API_KEY to backend/.env.' });
   }
 
   try {
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const file = await toFile(req.file.buffer, req.file.originalname || 'answer.webm', { type: req.file.mimetype });
-    const transcription = await openai.audio.transcriptions.create({ file, model: 'whisper-1' });
-    return res.json({ transcript: transcription.text });
+    const { transcript, pauseAnalysis } = await transcribeWithWhisper({
+      buffer: req.file.buffer,
+      name: req.file.originalname || 'answer.webm',
+      type: req.file.mimetype
+    });
+    return res.json({ transcript, pauseAnalysis });
   } catch (error) {
     console.error('Transcription failed:', error);
     return res.status(502).json({ error: 'The transcription service could not process this recording' });

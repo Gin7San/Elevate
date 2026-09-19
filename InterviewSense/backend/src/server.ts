@@ -14,7 +14,6 @@ import { csrfGuard } from './middleware/csrf.js';
 validateConfig();
 
 export const app = express();
-const port = Number(process.env.PORT ?? 4000);
 const allowedOrigins = (process.env.CLIENT_URL ?? 'http://localhost:5173')
   .split(',')
   .map((origin) => origin.trim())
@@ -56,8 +55,4 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   }
   console.error(error);
   return res.status(500).json({ error: 'An unexpected server error occurred' });
-});
-
-app.listen(port, '0.0.0.0', () => {
-  console.log(`InterviewSense API running on port ${port}`);
 });

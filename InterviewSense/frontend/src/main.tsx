@@ -3,9 +3,11 @@ import { createRoot } from 'react-dom/client';
 import './styles.css';
 
 type User = { id: string; email: string; name: string | null };
-type Analysis = { id: string; kind: string; score: number | null; details: { metrics?: Record<string, number | null> } | null };
+type Analysis = { id: string; kind: string; score: number | null; details: { metrics?: Record<string, number | null>; limitations?: string[] } | null };
 type Question = { id: string; text: string; order: number; answer: { transcript: string; mediaUrl?: string | null; durationMs?: number | null; analyses?: Analysis[] } | null };
-type Interview = { id: string; title: string; role: string | null; status: string; createdAt: string; _count?: { questions: number }; report: { overallScore: number | null } | null; questions?: Question[] };
+type Report = { overallScore: number | null; summary?: string | null; details?: { strengths?: string[]; improvements?: string[]; usedLlm?: boolean } | null };
+type Interview = { id: string; title: string; role: string | null; status: string; createdAt: string; _count?: { questions: number }; report: Report | null; questions?: Question[] };
+type PauseAnalysis = { pauseCount: number; longPauseCount: number; totalPauseMs: number; longestPauseMs: number; speakingRate: number | null; audioDurationMs: number | null; timestampedTranscription: true };
 type AuthResponse = { user: User; token?: string; csrfToken?: string };
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ?? '/api/v1';
 const MEDIA_URL = (import.meta.env.VITE_MEDIA_URL as string | undefined)?.replace(/\/$/, '') ?? '';
@@ -56,6 +58,7 @@ function App() {
   const [forgotResult, setForgotResult] = useState<{ message: string; resetToken?: string } | null>(null);
   const [resetToken, setResetToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [pauseMetrics, setPauseMetrics] = useState<PauseAnalysis | null>(null);
   useEffect(() => {
     authFetch(`${API_URL}/me`)
       .then(async (r) => (r.ok ? r.json() : Promise.reject()))
@@ -196,6 +199,7 @@ function App() {
     if (!r.ok) return setError(d.error ?? 'Could not load interview');
     setSelected(d.interview);
     setQuestionIndex(0);
+    setPauseMetrics(null);
     setAnswer(d.interview.questions[0]?.answer?.transcript ?? '');
     setRecordedUrl(d.interview.questions[0]?.answer?.mediaUrl ? `${MEDIA_URL}${d.interview.questions[0].answer.mediaUrl}` : '');
     setRecordedBlob(null);
@@ -263,6 +267,7 @@ function App() {
     payload.append('questionId', question.id);
     payload.append('transcript', answer);
     if (recordingDuration) payload.append('durationMs', String(recordingDuration));
+    if (pauseMetrics) payload.append('pauseAnalysis', JSON.stringify(pauseMetrics));
     if (recordedBlob) {
       try {
         const voiceMetrics = await analyzeRecordedVoice(recordedBlob);
@@ -310,6 +315,7 @@ function App() {
     if (questionIndex < selected.questions.length - 1) {
       const next = questionIndex + 1;
       setQuestionIndex(next);
+      setPauseMetrics(null);
       setAnswer(selected.questions[next].answer?.transcript ?? '');
       setRecordedUrl(selected.questions[next].answer?.mediaUrl ? `${MEDIA_URL}${selected.questions[next].answer.mediaUrl}` : '');
       setRecordedBlob(null);
@@ -323,8 +329,9 @@ function App() {
         setError(data.error ?? 'Could not complete interview');
         return;
       }
-      setSelected(null);
       setInterviews((current) => current.map((i) => (i.id === selected.id ? { ...i, status: 'COMPLETED', report: data.report } : i)));
+      // Reload so the report panel (narrative feedback) is shown immediately.
+      await openInterview({ ...selected, status: 'COMPLETED' });
     }
   }
 
@@ -376,6 +383,8 @@ function App() {
       const data = await r.json();
       if (!r.ok) throw new Error(data.error ?? 'Transcription failed');
       setAnswer(data.transcript);
+      // Server-derived pause metrics (word timestamps) flow into fluency scoring.
+      setPauseMetrics(data.pauseAnalysis ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Transcription failed');
     } finally {
@@ -610,6 +619,30 @@ function App() {
           <div className="progress">
             <span style={{ width: `${((questionIndex + 1) / selected.questions.length) * 100}%` }} />
           </div>
+          {selected.status === 'COMPLETED' && selected.report?.summary && (
+            <div className="report-panel">
+              <p className="eyebrow">INTERVIEW REPORT</p>
+              <h2>{selected.report.overallScore != null ? `${selected.report.overallScore}/100` : 'Report ready'}</h2>
+              <p className="report-summary">{selected.report.summary}</p>
+              <div className="report-columns">
+                {!!selected.report.details?.strengths?.length && (
+                  <div>
+                    <b>Strengths</b>
+                    <ul>{selected.report.details.strengths.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                  </div>
+                )}
+                {!!selected.report.details?.improvements?.length && (
+                  <div>
+                    <b>Next steps</b>
+                    <ul>{selected.report.details.improvements.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                  </div>
+                )}
+              </div>
+              {selected.report.details?.usedLlm === false && (
+                <small className="report-note">Deterministic analysis summary — set OPENAI_API_KEY on the backend for LLM-written feedback.</small>
+              )}
+            </div>
+          )}
           <h1>{question.text}</h1>
           <p className="form-intro">Answer by typing or record yourself using your camera and microphone.</p>
           <div className="recorder-card">
@@ -646,26 +679,50 @@ function App() {
             </div>
           </div>
           <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="Write your answer here…" />
-          {savedAnalyses.length > 0 && (
-            <div className="analysis-panel">
-              <div>
-                <p className="eyebrow">LATEST ANALYSIS</p>
-                <h2>{answerScore != null ? `${answerScore}/100` : 'Analysis ready'}</h2>
-              </div>
-              <div className="metric-list">
-                {speech && (
-                  <span>
-                    Speech fluency <b>{speech.score ?? '—'}</b>
-                  </span>
+          {savedAnalyses.length > 0 && (() => {
+            const metrics = speech?.details?.metrics ?? {};
+            const voiceMetricsDetails = voice?.details?.metrics ?? {};
+            const limitations = [...new Set(savedAnalyses.flatMap((item) => item.details?.limitations ?? []))];
+            const chips: Array<[string, string]> = [];
+            if (metrics.speakingRate != null) chips.push(['Speaking rate', `${metrics.speakingRate} wpm`]);
+            if (metrics.fillerRate != null) chips.push(['Filler words', `${metrics.fillerRate}%`]);
+            if (metrics.pauseCount != null) chips.push(['Pauses', String(metrics.pauseCount)]);
+            if (metrics.longPauseCount != null) chips.push(['Long pauses', String(metrics.longPauseCount)]);
+            if (voiceMetricsDetails.pauseScore != null) chips.push(['Pause score', String(voiceMetricsDetails.pauseScore)]);
+            if (voiceMetricsDetails.energyScore != null) chips.push(['Energy', String(voiceMetricsDetails.energyScore)]);
+            return (
+              <div className="analysis-panel">
+                <div>
+                  <p className="eyebrow">LATEST ANALYSIS</p>
+                  <h2>{answerScore != null ? `${answerScore}/100` : 'Analysis ready'}</h2>
+                </div>
+                <div className="metric-list">
+                  {speech && (
+                    <span>
+                      Speech fluency <b>{speech.score ?? '—'}</b>
+                    </span>
+                  )}
+                  {voice && (
+                    <span>
+                      Voice delivery <b>{voice.score ?? '—'}</b>
+                    </span>
+                  )}
+                  {chips.map(([label, value]) => (
+                    <span key={label}>
+                      {label} <b>{value}</b>
+                    </span>
+                  ))}
+                </div>
+                {limitations.length > 0 && (
+                  <ul className="limitations">
+                    {limitations.map((limitation, index) => (
+                      <li key={index}>{limitation}</li>
+                    ))}
+                  </ul>
                 )}
-                {voice && (
-                  <span>
-                    Voice delivery <b>{voice.score ?? '—'}</b>
-                  </span>
-                )}
               </div>
-            </div>
-          )}
+            );
+          })()}
           <div className="interview-actions">
             <button className="text-button" onClick={saveAndExit}>
               Save and exit
@@ -725,7 +782,10 @@ function App() {
                     {i.role || 'General interview'} · {i._count?.questions ?? 0} questions
                   </p>
                 </div>
-                <span className={`status ${i.status.toLowerCase()}`}>{i.status.replace('_', ' ')}</span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  {i.report?.overallScore != null && <span className="score-chip">{i.report.overallScore}/100</span>}
+                  <span className={`status ${i.status.toLowerCase()}`}>{i.status.replace('_', ' ')}</span>
+                </span>
               </article>
             ))}
           </div>

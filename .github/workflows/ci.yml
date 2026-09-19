@@ -14,6 +14,20 @@ jobs:
     defaults:
       run:
         working-directory: InterviewSense
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: interviewsense
+          POSTGRES_USER: interviewsense
+          POSTGRES_PASSWORD: interviewsense_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U interviewsense -d interviewsense"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,5 +43,12 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm run prisma --prefix backend -- generate
       - run: npm run check
+      - name: Apply migrations and run e2e route tests
+        run: |
+          npm run prisma --prefix backend -- migrate deploy
+          npm run test:e2e --prefix backend
+        env:
+          DATABASE_URL: postgresql://interviewsense:interviewsense_dev@localhost:5432/interviewsense?schema=public
+          JWT_SECRET: ci-only-secret-ci-only-secret-ci-only-secret-ci
       - run: npm audit --omit=dev --audit-level=high --prefix backend
       - run: npm audit --omit=dev --audit-level=high --prefix frontend
