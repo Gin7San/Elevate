@@ -14,13 +14,15 @@ enum InterviewStatus {
 }
 
 model User {
-  id           String            @id @default(cuid())
-  email        String            @unique
-  passwordHash String
-  name         String?
-  createdAt    DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
-  interviews   InterviewSession[]
+  id                   String            @id @default(cuid())
+  email                String            @unique
+  passwordHash         String
+  name                 String?
+  passwordResetToken   String?           @unique
+  passwordResetExpires DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  interviews           InterviewSession[]
 }
 
 model InterviewSession {
