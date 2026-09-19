@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>README.md</title>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <link rel="stylesheet" media="all" href="doc-style.css" />
+  <script src="doc-filelist.js"></script>
+  <script>
+    var relativeDir = "";
+    var thisFile = "README.md";
+    var defaultSidebar = true;
+  </script>
+  <script src="doc-script.js"></script>
+
+</head>
+<body>
+  <div id="sidebar_wrapper">
+    <div id="sidebar_switch">
+      <span class="tree">Files</span>
+      <span class="headings">Headings</span>
+    </div>
+    <div id="tree"></div>
+    <div id="headings">
+
+      <div class="heading h1">
+        <a href="#interviewsense">InterviewSense</a>
+      </div>
+
+      <div class="heading h2">
+        <a href="#stack">Stack</a>
+      </div>
+
+      <div class="heading h2">
+        <a href="#start-postgresql">Start PostgreSQL</a>
+      </div>
+
+      <div class="heading h2">
+        <a href="#install-dependencies">Install dependencies</a>
+      </div>
+
+      <div class="heading h2">
+        <a href="#run-the-app">Run the app</a>
+      </div>
+
+    </div>
+  </div>
+  <div id="sidebar-toggle"></div>
+  <div id="container">
+    <div class="docs markdown"><div class="pilwrap" id="interviewsense">
+  <h1>
+    <a href="#interviewsense" name="interviewsense" class="pilcrow"></a>
+InterviewSense
+  </h1>
+</div>
+<p>AI-powered mock interviews and multimodal confidence assessment.</p>
+<div class="pilwrap" id="stack">
+  <h2>
+    <a href="#stack" name="stack" class="pilcrow"></a>
+Stack
+  </h2>
+</div>
+<ul>
+<li>Frontend: React, TypeScript, Vite</li>
+<li>Backend: Node.js, Express, TypeScript</li>
+<li>Database: PostgreSQL with Prisma</li>
+<li>Planned analysis: Whisper, MediaPipe, Librosa, and an LLM API</li>
+</ul>
+<div class="pilwrap" id="start-postgresql">
+  <h2>
+    <a href="#start-postgresql" name="start-postgresql" class="pilcrow"></a>
+Start PostgreSQL
+  </h2>
+</div>
+<pre><code class="bash">docker compose up -d
+</code></pre>
+<div class="pilwrap" id="install-dependencies">
+  <h2>
+    <a href="#install-dependencies" name="install-dependencies" class="pilcrow"></a>
+Install dependencies
+  </h2>
+</div>
+<pre><code class="bash">npm install
+npm run install:all
+</code></pre>
+<p>Copy <code>backend/.env.example</code> to <code>backend/.env</code>, then initialize Prisma. The API now includes <code>POST /api/v1/auth/register</code>, <code>POST /api/v1/auth/login</code>, and protected <code>GET /api/v1/me</code> routes.</p>
+<p>Initialize Prisma:</p>
+<pre><code class="bash"><span class="hljs-built_in">cd</span> backend
+npx prisma migrate dev --name init
+</code></pre>
+<div class="pilwrap" id="run-the-app">
+  <h2>
+    <a href="#run-the-app" name="run-the-app" class="pilcrow"></a>
+Run the app
+  </h2>
+</div>
+<p>From the project root:</p>
+<pre><code class="bash">npm run dev
+</code></pre>
+<p>Frontend: http://localhost:5173<br>
+Backend: http://localhost:4000/health</p>
+</div>
+  </div>
+</body>
+</html>

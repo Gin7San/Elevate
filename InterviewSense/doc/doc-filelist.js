@@ -1,0 +1,1 @@
+var tree={"files":["docker-compose.yml","package.json","README.md"],"dirs":{"backend":{"files":["package-lock.json","package.json","tsconfig.json"]},"frontend":{"files":["index.html","package-lock.json","package.json","tsconfig.json"],"dirs":{"src":{"files":["styles.css"]}}}}};

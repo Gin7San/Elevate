@@ -1,0 +1,16 @@
+How to demonstrate it
+During your meeting, demonstrate these items:
+
+Start PostgreSQL with Docker.
+Start the frontend and backend.
+Open the InterviewSense interface.
+Create a new account.
+Show that the password is stored as a hash in the database.
+Log out.
+Log back in.
+Show that the protected user endpoint works.
+Show the Prisma schema and database relationships.
+Explain the planned AI-analysis pipeline.
+This demonstrates meaningful technical progress while accurately communicating that the project is still under development.
+
+

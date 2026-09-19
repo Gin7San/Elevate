@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>styles.css</title>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <link rel="stylesheet" media="all" href="../../doc-style.css" />
+  <script src="../../doc-filelist.js"></script>
+  <script>
+    var relativeDir = "../../";
+    var thisFile = "frontend\\src\\styles.css";
+    var defaultSidebar = true;
+  </script>
+  <script src="../../doc-script.js"></script>
+
+</head>
+<body>
+  <div id="sidebar_wrapper">
+    <div id="sidebar_switch">
+      <span class="tree">Files</span>
+      <span class="headings">Headings</span>
+    </div>
+    <div id="tree"></div>
+    <div id="headings">
+
+    </div>
+  </div>
+  <div id="sidebar-toggle"></div>
+  <div id="container">
+    <div class="background highlight"></div>
+<table cellpadding="0" cellspacing="0">
+  <tbody>
+    
+      <tr>
+        <td class="docs">
+          <h1>styles.css</h1>
+        </td>
+        <td class="code highlight"></td>
+      </tr>
+    
+    
+      <tr>
+        <td class="docs">
+          <div class="pilwrap">
+  <a class="pilcrow" href="#section-1" id="section-1"></a>
+</div>
+
+        </td>
+        <td class="code highlight">
+          <pre class="css">@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&amp;family=Manrope:wght@400;600;700;800&amp;display=swap');
+:root{font-family:Manrope,system-ui,sans-serif;color:#17211e;background:#f5f5f0}*{box-sizing:border-box}body{margin:0}.shell{max-width:1180px;margin:auto;padding:24px 42px}.topbar{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #d8ddd7;padding:12px 0 23px;font-size:14px}.topbar strong{font-size:19px;letter-spacing:-.04em}.topbar span,.eyebrow{font-family:'DM Mono',monospace;color:#65716b;font-size:11px;letter-spacing:.1em;text-transform:uppercase}.eyebrow{color:#e36d42}.auth-layout{display:grid;grid-template-columns:1fr 390px;gap:90px;align-items:center;min-height:calc(100vh - 100px)}h1{font-size:clamp(48px,6vw,78px);line-height:.98;letter-spacing:-.075em;margin:20px 0 28px}h1 em{font-style:normal;color:#e36d42}.lede{max-width:480px;color:#65716b;font-size:17px;line-height:1.65}.auth-card{background:#fff;border:1px solid #e0e4de;border-radius:20px;padding:30px;box-shadow:0 14px 45px #26342b0d}.auth-tabs{display:flex;gap:8px;border-bottom:1px solid #e2e6e0;margin:-6px 0 28px;padding-bottom:14px}.auth-tabs button,.text-button{background:none;border:0;color:#65716b;font:600 13px Manrope;padding:6px 8px;cursor:pointer}.auth-tabs button.active{color:#17211e;border-bottom:2px solid #e36d42}.auth-card h2{font-size:25px;letter-spacing:-.05em;margin:0 0 7px}.form-intro{color:#65716b;font-size:13px;margin:0 0 25px}label{display:block;font-size:12px;font-weight:700;margin:17px 0;color:#34423c}input{display:block;width:100%;border:1px solid #d8ddd7;border-radius:8px;background:#fafbf9;padding:13px 12px;margin-top:7px;font:14px Manrope;color:#17211e;outline:none}input:focus{border-color:#e36d42;box-shadow:0 0 0 3px #e36d4220}.submit-button,button:not(.auth-tabs button):not(.text-button){border:0;border-radius:40px;background:#17211e;color:#fff;padding:16px 23px;font:600 14px Manrope;cursor:pointer}.submit-button{width:100%;margin-top:10px}.submit-button:disabled{opacity:.6;cursor:wait}.error{background:#fff0ed;color:#b33e21;border-radius:7px;padding:10px;font-size:12px}.dashboard-shell{min-height:100vh}.text-button{color:#17211e}.dashboard-welcome{padding:90px 0 75px}.dashboard-welcome h1{margin-bottom:24px}.dashboard-welcome button span{font-size:20px;margin-left:14px}.create-panel{display:flex;justify-content:space-between;gap:30px;align-items:end;background:#e9eee7;padding:24px;border-radius:14px}.create-panel h2,.history h2{margin:6px 0;font-size:23px;letter-spacing:-.05em}.create-panel p:not(.eyebrow){color:#65716b;font-size:13px;margin:8px 0 0}.create-panel form{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.create-panel input{width:170px;margin:0;background:#f8faf6}.create-panel button{white-space:nowrap}.history{margin-top:55px}.section-heading{border-bottom:1px solid #d8ddd7;padding-bottom:15px}.empty-state{border:1px dashed #cbd3cc;color:#65716b;padding:28px;margin-top:18px;font-size:13px}.interview-list{margin-top:12px}.interview-row{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #d8ddd7;padding:18px 4px}.interview-row b{font-size:15px}.interview-row p{color:#65716b;font-size:12px;margin:6px 0 0}.status{font:10px 'DM Mono';letter-spacing:.07em;text-transform:uppercase;color:#65716b}.status.in_progress{color:#e36d42}.error{margin-top:16px}.dashboard-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;border-top:1px solid #d8ddd7;padding-top:22px}.dashboard-grid article{padding:24px;background:#e9eee7;min-height:175px}.dashboard-grid b{font:26px 'DM Mono';color:#e36d42}.dashboard-grid h2{margin:30px 0 8px;font-size:17px;letter-spacing:-.04em}.dashboard-grid p{color:#65716b;font-size:13px;line-height:1.6;margin:0}@media(max-width:800px){.shell{padding:18px 22px}.auth-layout{grid-template-columns:1fr;gap:25px;padding:55px 0}.auth-copy h1{font-size:52px}.dashboard-grid{grid-template-columns:1fr}.dashboard-welcome{padding:70px 0 55px}}
+
+</pre>
+        </td>
+      </tr>
+    
+  </tbody>
+</table>
+
+  </div>
+</body>
+</html>
