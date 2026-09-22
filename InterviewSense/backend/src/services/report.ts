@@ -46,11 +46,20 @@ export function fallbackSummary(digest: QuestionDigest[], overallScore: number |
     .filter((question): question is { index: number; score: number } => question.score !== null)
     .sort((a, b) => b.score - a.score);
 
-  const speechMetrics = answered
-    .flatMap((question) => question.analyses)
-    .find((analysis) => analysis.kind === 'SPEECH_FLUENCY')?.metrics ?? {};
+  const allAnalyses = answered.flatMap((question) => question.analyses);
+
+  const speechMetrics = allAnalyses.find((a) => a.kind === 'SPEECH_FLUENCY')?.metrics ?? {};
   const fillerRate = typeof speechMetrics.fillerRate === 'number' ? speechMetrics.fillerRate : null;
   const longPauseCount = typeof speechMetrics.longPauseCount === 'number' ? speechMetrics.longPauseCount : null;
+
+  const eyeContactAnalyses = allAnalyses.filter((a) => a.kind === 'CAMERA_EYE_CONTACT').map((a) => a.score).filter((s): s is number => s !== null);
+  const avgEyeContact = eyeContactAnalyses.length ? eyeContactAnalyses.reduce((a, b) => a + b, 0) / eyeContactAnalyses.length : null;
+
+  const postureAnalyses = allAnalyses.filter((a) => a.kind === 'CAMERA_POSTURE').map((a) => a.score).filter((s): s is number => s !== null);
+  const avgPosture = postureAnalyses.length ? postureAnalyses.reduce((a, b) => a + b, 0) / postureAnalyses.length : null;
+
+  const contentAnalyses = allAnalyses.filter((a) => a.kind === 'ANSWER_CONTENT').map((a) => a.score).filter((s): s is number => s !== null);
+  const avgContent = contentAnalyses.length ? contentAnalyses.reduce((a, b) => a + b, 0) / contentAnalyses.length : null;
 
   const strengths: string[] = [];
   const improvements: string[] = [];
@@ -59,6 +68,11 @@ export function fallbackSummary(digest: QuestionDigest[], overallScore: number |
     const weakest = scored[scored.length - 1];
     if (scored.length > 1) improvements.push(`Revisit Q${weakest.index + 1} — it scored lowest (${Math.round(weakest.score)}/100).`);
   }
+  if (avgContent !== null && avgContent >= 80) strengths.push('Answer content was clear and structured.');
+  if (avgEyeContact !== null && avgEyeContact >= 80) strengths.push('Maintained steady eye contact with the camera.');
+  if (avgEyeContact !== null && avgEyeContact < 65) improvements.push('Focus on maintaining direct eye contact with the camera.');
+  if (avgPosture !== null && avgPosture < 65) improvements.push('Keep an upright, steady posture during responses.');
+
   if (fillerRate !== null && fillerRate > 3) improvements.push(`Reduce filler words (about ${fillerRate}% of words).`);
   if (longPauseCount !== null && longPauseCount > 0) improvements.push(`Watch for long pauses (${longPauseCount} pause${longPauseCount === 1 ? '' : 's'} over 2s).`);
   if (overallScore !== null && overallScore >= 80) strengths.push('Overall high confidence; keep it up.');
@@ -82,7 +96,7 @@ function buildPrompt(digest: QuestionDigest[]): string {
   }).join('\n\n');
 
   return [
-    'You are an interview coach reviewing a mock interview.',
+    'You are an interview coach reviewing a mock interview with multimodal feedback (speech fluency, voice delivery, camera presence: eye contact/expression/posture, and answer quality).',
     'Write a JSON object with keys "summary" (2-4 sentences, second person, supportive, concrete),',
     '"strengths" (up to 3 short bullet phrases), and "improvements" (up to 3 short, actionable bullet phrases).',
     'Base every claim only on the transcript excerpts and scores below.',
