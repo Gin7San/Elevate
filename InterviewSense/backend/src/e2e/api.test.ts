@@ -277,6 +277,58 @@ test('password reset: dev fallback token then reset then login', async (t) => {
   });
 });
 
+test('deleting an interview removes the session, media, and is owner-scoped', async () => {
+  const owner = makeJar();
+  const registered = await api('/api/v1/auth/register', {
+    json: { email: 'owner-delete@interviewsense.dev', password: PASSWORD, name: 'Owner' },
+    jar: owner
+  });
+  assert.equal(registered.status, 201);
+
+  const created = await api('/api/v1/interviews', {
+    json: { title: 'Disposable session', role: 'Designer' },
+    jar: owner,
+    csrf: true
+  });
+  assert.equal(created.status, 201);
+  const session = created.body!.interview as { id: string; questions: Array<{ id: string }> };
+
+  const form = new FormData();
+  form.set('questionId', session.questions[0].id);
+  form.set('transcript', 'A short answer worth keeping until the session is deleted.');
+  form.set('durationMs', '4000');
+  form.set('media', new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4, 5, 6, 7, 8])], { type: 'video/webm' }), 'answer.webm');
+  const answered = await api(`/api/v1/interviews/${session.id}/answers`, { form, jar: owner, csrf: true });
+  assert.equal(answered.status, 200, JSON.stringify(answered.body));
+  const signedMediaPath = answered.body!.answer.mediaUrl as string;
+  assert.ok(signedMediaPath?.startsWith('/api/v1/media/'), `signed media path: ${signedMediaPath}`);
+
+  const listed = await api('/api/v1/interviews', { jar: owner });
+  const row = (listed.body!.interviews as Array<{ id: string; answeredCount?: number }>).find((item) => item.id === session.id);
+  assert.equal(row?.answeredCount, 1, 'list includes how many questions have been answered');
+
+  const missingCsrf = await api(`/api/v1/interviews/${session.id}`, { method: 'DELETE', jar: owner });
+  assert.equal(missingCsrf.status, 403);
+
+  const stranger = makeJar();
+  const strangerRegister = await api('/api/v1/auth/register', {
+    json: { email: 'stranger-delete@interviewsense.dev', password: PASSWORD },
+    jar: stranger
+  });
+  assert.equal(strangerRegister.status, 201);
+  const notOwner = await api(`/api/v1/interviews/${session.id}`, { method: 'DELETE', jar: stranger, csrf: true });
+  assert.equal(notOwner.status, 404);
+
+  const removed = await api(`/api/v1/interviews/${session.id}`, { method: 'DELETE', jar: owner, csrf: true });
+  assert.equal(removed.status, 204);
+  const gone = await api(`/api/v1/interviews/${session.id}`, { jar: owner });
+  assert.equal(gone.status, 404);
+  const after = await api('/api/v1/interviews', { jar: owner });
+  assert.equal((after.body!.interviews as unknown[]).length, 0);
+  const media = await fetch(`${baseUrl}${signedMediaPath}`);
+  assert.equal(media.status, 404, 'deleted recordings are no longer served');
+});
+
 test('transcription endpoint guards auth and configuration', async () => {
   const unauthenticated = await api('/api/v1/transcription', { form: new FormData() });
   assert.equal(unauthenticated.status, 401);

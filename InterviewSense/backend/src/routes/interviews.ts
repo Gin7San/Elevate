@@ -97,7 +97,29 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res) => {
       report: { select: { overallScore: true } }
     }
   });
-  return res.json({ interviews });
+  // Flat queries only — nested includes are unreliable on the Rust-free Prisma client.
+  const questions: Array<{ id: string; sessionId: string }> = interviews.length === 0 ? [] : await prisma.question.findMany({
+    where: { sessionId: { in: interviews.map((interview: { id: string }) => interview.id) } },
+    select: { id: true, sessionId: true }
+  });
+  const answers: Array<{ questionId: string; transcript: string | null }> = questions.length === 0 ? [] : await prisma.answer.findMany({
+    where: { questionId: { in: questions.map((question) => question.id) } },
+    select: { questionId: true, transcript: true }
+  });
+  const sessionByQuestion = new Map(questions.map((question) => [question.id, question.sessionId]));
+  const answeredBySession = new Map<string, number>();
+  for (const answer of answers) {
+    if (!answer.transcript?.trim()) continue;
+    const sessionId = sessionByQuestion.get(answer.questionId);
+    if (!sessionId) continue;
+    answeredBySession.set(sessionId, (answeredBySession.get(sessionId) ?? 0) + 1);
+  }
+  return res.json({
+    interviews: interviews.map((interview) => ({
+      ...interview,
+      answeredCount: answeredBySession.get(interview.id) ?? 0
+    }))
+  });
 });
 
 router.post('/', requireAuth, async (req: AuthenticatedRequest, res) => {
@@ -279,6 +301,27 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
     answeredQuestions: questions.length,
     totalQuestions: questions.length
   });
+});
+
+router.delete('/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'Authentication required' });
+  const interview = await prisma.interviewSession.findFirst({
+    where: { id: req.params.id, userId: req.userId },
+    select: { id: true }
+  });
+  if (!interview) return res.status(404).json({ error: 'Interview not found' });
+
+  const questions: Array<{ id: string }> = await prisma.question.findMany({
+    where: { sessionId: interview.id },
+    select: { id: true }
+  });
+  const answers: Array<{ mediaUrl: string | null }> = questions.length === 0 ? [] : await prisma.answer.findMany({
+    where: { questionId: { in: questions.map((question) => question.id) } },
+    select: { mediaUrl: true }
+  });
+  await prisma.interviewSession.delete({ where: { id: interview.id } });
+  await Promise.all(answers.map((answer) => removeUpload(answer.mediaUrl)));
+  return res.status(204).end();
 });
 
 router.get('/:id', requireAuth, async (req: AuthenticatedRequest, res) => {

@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, ReactNode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
@@ -6,7 +6,7 @@ type User = { id: string; email: string; name: string | null };
 type Analysis = { id: string; kind: string; score: number | null; details: { metrics?: Record<string, number | null>; limitations?: string[] } | null };
 type Question = { id: string; text: string; order: number; answer: { transcript: string; mediaUrl?: string | null; durationMs?: number | null; analyses?: Analysis[] } | null };
 type Report = { overallScore: number | null; summary?: string | null; details?: { strengths?: string[]; improvements?: string[]; usedLlm?: boolean } | null };
-type Interview = { id: string; title: string; role: string | null; status: string; createdAt: string; _count?: { questions: number }; report: Report | null; questions?: Question[] };
+type Interview = { id: string; title: string; role: string | null; status: string; createdAt: string; answeredCount?: number; _count?: { questions: number }; report: Report | null; questions?: Question[] };
 type PauseAnalysis = { pauseCount: number; longPauseCount: number; totalPauseMs: number; longestPauseMs: number; speakingRate: number | null; audioDurationMs: number | null; timestampedTranscription: true };
 type AuthResponse = { user: User; token?: string; csrfToken?: string };
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ?? '/api/v1';
@@ -32,10 +32,83 @@ function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   return fetch(input, { credentials: 'include', ...init, headers });
 }
 
+function formatWhen(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes > 0 ? `${minutes}:${String(seconds).padStart(2, '0')}` : `${seconds}s`;
+}
+
+function firstUnansweredIndex(questions: Question[]): number {
+  const index = questions.findIndex((question) => !question.answer?.transcript?.trim());
+  return index === -1 ? 0 : index;
+}
+
+function meanScore(interviews: Interview[]): number | null {
+  const scores = interviews.flatMap((interview) => interview.report?.overallScore ?? []);
+  if (scores.length === 0) return null;
+  return Math.round(scores.reduce((total, score) => total + score, 0) / scores.length);
+}
+
+function Frame({ className, children }: { className?: string; children: ReactNode }) {
+  return (
+    <>
+      <a className="skip-link" href="#content">Skip to content</a>
+      <main id="content" className={className ? `shell ${className}` : 'shell'}>
+        {children}
+      </main>
+    </>
+  );
+}
+
+function PasswordField({
+  label,
+  value,
+  onChange,
+  autoComplete,
+  shown,
+  onToggle
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  autoComplete: string;
+  shown: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <label>
+      {label}
+      <span className="password-field">
+        <input
+          type={shown ? 'text' : 'password'}
+          required
+          minLength={8}
+          value={value}
+          autoComplete={autoComplete}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="At least 8 characters"
+        />
+        <button type="button" className="text-button password-toggle" onClick={onToggle} aria-pressed={shown} aria-label={shown ? 'Hide password' : 'Show password'}>
+          {shown ? 'Hide' : 'Show'}
+        </button>
+      </span>
+    </label>
+  );
+}
+
 function App() {
   const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login');
   const [user, setUser] = useState<User | null>(null);
+  const [booting, setBooting] = useState(true);
   const [interviews, setInterviews] = useState<Interview[]>([]);
+  const [interviewsReady, setInterviewsReady] = useState(false);
   const [selected, setSelected] = useState<Interview | null>(null);
   const [questionIndex, setQuestionIndex] = useState(0);
   const [answer, setAnswer] = useState('');
@@ -48,22 +121,40 @@ function App() {
   const mediaStream = useRef<MediaStream | null>(null);
   const recordedChunks = useRef<Blob[]>([]);
   const recordingStartedAt = useRef(0);
+  const savingRef = useRef(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const [interviewForm, setInterviewForm] = useState({ title: '', role: '' });
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [openingId, setOpeningId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotResult, setForgotResult] = useState<{ message: string; resetToken?: string } | null>(null);
   const [resetToken, setResetToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [pauseMetrics, setPauseMetrics] = useState<PauseAnalysis | null>(null);
+
   useEffect(() => {
+    let cancelled = false;
     authFetch(`${API_URL}/me`)
-      .then(async (r) => (r.ok ? r.json() : Promise.reject()))
-      .then((d) => setUser(d.user))
-      .catch(() => setUser(null));
+      .then(async (response) => (response.ok ? response.json() : Promise.reject()))
+      .then((data) => {
+        if (!cancelled) setUser(data.user);
+      })
+      .catch(() => {
+        if (!cancelled) setUser(null);
+      })
+      .finally(() => {
+        if (!cancelled) setBooting(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -76,6 +167,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    document.title = selected
+      ? `${selected.title} · InterviewSense`
+      : user
+        ? 'Dashboard · InterviewSense'
+        : 'InterviewSense';
+  }, [selected, user]);
+
+  useEffect(() => {
     if (recording && videoPreview.current && mediaStream.current) {
       videoPreview.current.srcObject = mediaStream.current;
       videoPreview.current.play().catch(() => undefined);
@@ -83,11 +182,35 @@ function App() {
   }, [recording]);
 
   useEffect(() => {
-    if (!user) return;
+    if (!recording) return;
+    const timer = window.setInterval(() => {
+      setRecordingDuration(Date.now() - recordingStartedAt.current);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [recording]);
+
+  useEffect(() => {
+    if (!user) {
+      setInterviews([]);
+      setInterviewsReady(false);
+      return;
+    }
+    let cancelled = false;
+    setInterviewsReady(false);
     authFetch(`${API_URL}/interviews`)
-      .then((r) => r.json())
-      .then((d) => setInterviews(d.interviews ?? []))
-      .catch(() => setError('Could not load your interviews.'));
+      .then((response) => response.json())
+      .then((data) => {
+        if (!cancelled) setInterviews(data.interviews ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setError('Could not load your interviews.');
+      })
+      .finally(() => {
+        if (!cancelled) setInterviewsReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
   useEffect(() => () => {
@@ -96,23 +219,68 @@ function App() {
 
   useEffect(() => () => mediaStream.current?.getTracks().forEach((track) => track.stop()), []);
 
+  useEffect(() => {
+    const current = selected?.questions?.[questionIndex];
+    const dirty = recording || answer.trim() !== (current?.answer?.transcript ?? '').trim() || recordedBlob != null;
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [recording, selected, answer, questionIndex, recordedBlob]);
+
+  function abandonRecording() {
+    const recorder = mediaRecorder.current;
+    if (recorder && recorder.state === 'recording') {
+      recorder.onstop = null;
+      recorder.stop();
+    }
+    mediaStream.current?.getTracks().forEach((track) => track.stop());
+    mediaStream.current = null;
+    mediaRecorder.current = null;
+    setRecording(false);
+  }
+
+  function showQuestion(interview: Interview, index: number) {
+    const question = interview.questions?.[index];
+    setQuestionIndex(index);
+    setPauseMetrics(null);
+    setConfirmLeave(false);
+    setError('');
+    setAnswer(question?.answer?.transcript ?? '');
+    setRecordedUrl(question?.answer?.mediaUrl ? `${MEDIA_URL}${question.answer.mediaUrl}` : '');
+    setRecordedBlob(null);
+    setRecordingDuration(question?.answer?.durationMs ?? 0);
+  }
+
+  function leaveInterview() {
+    abandonRecording();
+    setRecordedBlob(null);
+    setRecordedUrl('');
+    setPauseMetrics(null);
+    setConfirmLeave(false);
+    setSelected(null);
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     setError('');
     setInfo('');
     setLoading(true);
     try {
-      const r = await authFetch(`${API_URL}/auth/${mode}`, {
+      const response = await authFetch(`${API_URL}/auth/${mode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(mode === 'register' ? form : { email: form.email, password: form.password })
       });
-      const d = (await r.json()) as AuthResponse & { error?: string };
-      if (!r.ok) throw new Error(d.error ?? 'Something went wrong');
+      const data = (await response.json()) as AuthResponse & { error?: string };
+      if (!response.ok) throw new Error(data.error ?? 'Something went wrong');
       // Server sets the HttpOnly session cookie; nothing is stored in JS.
-      setUser(d.user);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to connect to the API');
+      setUser(data.user);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to connect to the API');
     } finally {
       setLoading(false);
     }
@@ -125,20 +293,18 @@ function App() {
     setForgotResult(null);
     setLoading(true);
     try {
-      const r = await authFetch(`${API_URL}/auth/forgot-password`, {
+      const response = await authFetch(`${API_URL}/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: forgotEmail })
       });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error ?? 'Could not request password reset');
-      setForgotResult({ message: d.message, resetToken: d.resetToken });
-      setInfo(d.message);
-      if (d.resetToken) {
-        setResetToken(d.resetToken);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to connect to the API');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? 'Could not request password reset');
+      setForgotResult({ message: data.message, resetToken: data.resetToken });
+      setInfo(data.message);
+      if (data.resetToken) setResetToken(data.resetToken);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to connect to the API');
     } finally {
       setLoading(false);
     }
@@ -150,20 +316,19 @@ function App() {
     setInfo('');
     setLoading(true);
     try {
-      const r = await authFetch(`${API_URL}/auth/reset-password`, {
+      const response = await authFetch(`${API_URL}/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: resetToken, password: newPassword })
       });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error ?? 'Could not reset password');
-      setInfo(d.message ?? 'Password has been reset successfully. You can now log in.');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? 'Could not reset password');
+      setInfo(data.message ?? 'Password has been reset successfully. You can now log in.');
       setMode('login');
       setNewPassword('');
-      // Clear token from URL
       window.history.replaceState({}, '', window.location.pathname);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to connect to the API');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to connect to the API');
     } finally {
       setLoading(false);
     }
@@ -174,36 +339,69 @@ function App() {
     setError('');
     setLoading(true);
     try {
-      const r = await authFetch(`${API_URL}/interviews`, {
+      const response = await authFetch(`${API_URL}/interviews`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(interviewForm)
       });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error);
-      const created = { ...d.interview, _count: { questions: d.interview.questions.length }, report: null };
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      const created = { ...data.interview, answeredCount: 0, _count: { questions: data.interview.questions.length }, report: null };
       setInterviews((current) => [created, ...current]);
       setInterviewForm({ title: '', role: '' });
-      openInterview(created);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not create interview');
+      await openInterview(created);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not create interview');
     } finally {
       setLoading(false);
     }
   }
 
-  async function openInterview(interview: Interview) {
+  async function openInterview(interview: Interview, startAt?: number) {
     setError('');
-    const r = await authFetch(`${API_URL}/interviews/${interview.id}`);
-    const d = await r.json();
-    if (!r.ok) return setError(d.error ?? 'Could not load interview');
-    setSelected(d.interview);
-    setQuestionIndex(0);
-    setPauseMetrics(null);
-    setAnswer(d.interview.questions[0]?.answer?.transcript ?? '');
-    setRecordedUrl(d.interview.questions[0]?.answer?.mediaUrl ? `${MEDIA_URL}${d.interview.questions[0].answer.mediaUrl}` : '');
-    setRecordedBlob(null);
-    setRecordingDuration(d.interview.questions[0]?.answer?.durationMs ?? 0);
+    setOpeningId(interview.id);
+    try {
+      const response = await authFetch(`${API_URL}/interviews/${interview.id}`);
+      const data = await response.json();
+      if (!response.ok) {
+        setError(data.error ?? 'Could not load interview');
+        return;
+      }
+      const loaded = data.interview as Interview;
+      const start = startAt ?? (loaded.status === 'COMPLETED' ? 0 : firstUnansweredIndex(loaded.questions ?? []));
+      const answeredCount = (loaded.questions ?? []).filter((item) => item.answer?.transcript?.trim()).length;
+      abandonRecording();
+      setSelected(loaded);
+      setInterviews((current) => current.map((item) => (
+        item.id === loaded.id
+          ? { ...item, status: loaded.status, answeredCount, report: loaded.report ?? item.report }
+          : item
+      )));
+      showQuestion(loaded, start);
+    } catch {
+      setError('Could not load interview');
+    } finally {
+      setOpeningId(null);
+    }
+  }
+
+  async function removeInterview(id: string) {
+    setError('');
+    setLoading(true);
+    try {
+      const response = await authFetch(`${API_URL}/interviews/${id}`, { method: 'DELETE' });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error ?? 'Could not delete interview');
+      }
+      setInterviews((current) => current.filter((interview) => interview.id !== id));
+      setPendingDelete(null);
+      if (selected?.id === id) leaveInterview();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not delete interview');
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function analyzeRecordedVoice(blob: Blob) {
@@ -238,7 +436,7 @@ function App() {
         }
       }
       if ((silentRun * frameSize) / audio.sampleRate >= 2) longPauseCount++;
-      const mean = (values: number[]) => values.reduce((a, b) => a + b, 0) / Math.max(1, values.length);
+      const mean = (values: number[]) => values.reduce((total, value) => total + value, 0) / Math.max(1, values.length);
       const averageRms = mean(rmsValues);
       const averageCrossing = mean(crossingValues);
       const std = (values: number[], avg: number) => Math.sqrt(mean(values.map((value) => (value - avg) ** 2)));
@@ -257,12 +455,14 @@ function App() {
   }
 
   async function saveAnswer() {
-    if (!selected || !selected.questions) return false;
+    if (!selected || !selected.questions || savingRef.current) return false;
     const question = selected.questions[questionIndex];
     if (!answer.trim()) {
       setError('Please write an answer before continuing.');
       return false;
     }
+    savingRef.current = true;
+    setSaving(true);
     const payload = new FormData();
     payload.append('questionId', question.id);
     payload.append('transcript', answer);
@@ -277,62 +477,108 @@ function App() {
         setError('The recording could not be analyzed. The text answer will still be saved.');
       }
     }
-    const r = await authFetch(`${API_URL}/interviews/${selected.id}/answers`, {
-      method: 'POST',
-      body: payload
-    });
-    if (!r.ok) {
-      const d = await r.json();
-      setError(d.error ?? 'Could not save answer');
+    try {
+      const response = await authFetch(`${API_URL}/interviews/${selected.id}/answers`, {
+        method: 'POST',
+        body: payload
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        setError(data.error ?? 'Could not save answer');
+        return false;
+      }
+      const data = await response.json();
+      const answeredCount = selected.questions.filter((item, index) =>
+        index === questionIndex || Boolean(item.answer?.transcript?.trim())
+      ).length;
+      setSelected((current) =>
+        current?.questions
+          ? {
+              ...current,
+              answeredCount,
+              questions: current.questions.map((item, index) =>
+                index === questionIndex
+                  ? {
+                      ...item,
+                      answer: {
+                        transcript: answer,
+                        mediaUrl: data.answer?.mediaUrl ?? null,
+                        durationMs: data.answer?.durationMs ?? recordingDuration,
+                        analyses: [data.speechAnalysis, data.voiceAnalysis].filter(Boolean)
+                      }
+                    }
+                  : item
+              )
+            }
+          : current
+      );
+      setInterviews((current) =>
+        current.map((interview) => (interview.id === selected.id ? { ...interview, answeredCount } : interview))
+      );
+      setRecordedBlob(null);
+      return true;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not save answer');
+      return false;
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  async function completeInterview() {
+    if (!selected?.questions) return false;
+    const response = await authFetch(`${API_URL}/interviews/${selected.id}/complete`, { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok) {
+      setError(data.error ?? 'Could not complete interview');
       return false;
     }
-    const data = await r.json();
-    setSelected((current) =>
-      current?.questions
-        ? {
-            ...current,
-            questions: current.questions.map((item, index) =>
-              index === questionIndex
-                ? {
-                    ...item,
-                    answer: {
-                      transcript: answer,
-                      mediaUrl: data.answer?.mediaUrl ?? null,
-                      durationMs: data.answer?.durationMs ?? recordingDuration,
-                      analyses: [data.speechAnalysis, data.voiceAnalysis].filter(Boolean)
-                    }
-                  }
-                : item
-            )
-          }
-        : current
-    );
+    setInterviews((current) => current.map((interview) => (
+      interview.id === selected.id ? { ...interview, status: 'COMPLETED', report: data.report, answeredCount: selected.questions?.length ?? interview.answeredCount } : interview
+    )));
+    await openInterview({ ...selected, status: 'COMPLETED' }, selected.questions.length - 1);
     return true;
   }
 
   async function nextQuestion() {
-    if (!(await saveAnswer()) || !selected?.questions) return;
-    if (questionIndex < selected.questions.length - 1) {
-      const next = questionIndex + 1;
-      setQuestionIndex(next);
-      setPauseMetrics(null);
-      setAnswer(selected.questions[next].answer?.transcript ?? '');
-      setRecordedUrl(selected.questions[next].answer?.mediaUrl ? `${MEDIA_URL}${selected.questions[next].answer.mediaUrl}` : '');
-      setRecordedBlob(null);
-      setRecordingDuration(selected.questions[next].answer?.durationMs ?? 0);
-    } else {
-      const r = await authFetch(`${API_URL}/interviews/${selected.id}/complete`, {
-        method: 'POST'
-      });
-      const data = await r.json();
-      if (!r.ok) {
-        setError(data.error ?? 'Could not complete interview');
-        return;
-      }
-      setInterviews((current) => current.map((i) => (i.id === selected.id ? { ...i, status: 'COMPLETED', report: data.report } : i)));
-      // Reload so the report panel (narrative feedback) is shown immediately.
-      await openInterview({ ...selected, status: 'COMPLETED' });
+    if (!selected?.questions || savingRef.current) return;
+    if (recording) {
+      setError('Stop the recording before continuing.');
+      return;
     }
+    const current = selected.questions[questionIndex];
+    const dirty = answer.trim() !== (current.answer?.transcript ?? '').trim() || recordedBlob != null;
+    if (dirty || !current.answer?.transcript?.trim()) {
+      if (!(await saveAnswer())) return;
+    }
+    if (questionIndex < selected.questions.length - 1) {
+      showQuestion(selected, questionIndex + 1);
+      return;
+    }
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await completeInterview();
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  async function goToQuestion(index: number) {
+    if (!selected?.questions || index === questionIndex || savingRef.current) return;
+    if (index < 0 || index >= selected.questions.length) return;
+    if (recording) {
+      setError('Stop the recording before leaving this question.');
+      return;
+    }
+    const current = selected.questions[questionIndex];
+    const dirty = answer.trim() !== (current.answer?.transcript ?? '').trim() || recordedBlob != null;
+    if (dirty) {
+      if (!(await saveAnswer())) return;
+    }
+    showQuestion(selected, index);
   }
 
   async function startRecording() {
@@ -357,8 +603,14 @@ function App() {
       recordingStartedAt.current = Date.now();
       recorder.start();
       setRecording(true);
-    } catch {
-      setError('Camera and microphone access is required. Please allow permission in your browser.');
+      setRecordingDuration(0);
+    } catch (cause) {
+      mediaStream.current?.getTracks().forEach((track) => track.stop());
+      mediaStream.current = null;
+      const denied = cause instanceof DOMException && (cause.name === 'NotAllowedError' || cause.name === 'NotFoundError');
+      setError(denied
+        ? 'Camera and microphone access is required. Please allow permission in your browser.'
+        : 'Recording could not be started in this browser.');
     }
   }
 
@@ -376,30 +628,55 @@ function App() {
     const payload = new FormData();
     payload.append('media', recordedBlob, 'answer.webm');
     try {
-      const r = await authFetch(`${API_URL}/transcription`, {
+      const response = await authFetch(`${API_URL}/transcription`, {
         method: 'POST',
         body: payload
       });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error ?? 'Transcription failed');
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? 'Transcription failed');
       setAnswer(data.transcript);
       // Server-derived pause metrics (word timestamps) flow into fluency scoring.
       setPauseMetrics(data.pauseAnalysis ?? null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Transcription failed');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Transcription failed');
     } finally {
       setTranscribing(false);
     }
   }
 
   async function saveAndExit() {
-    if (answer.trim() && !(await saveAnswer())) return;
-    stopRecording();
-    setSelected(null);
+    if (recording) {
+      setError('Stop the recording before leaving so it can be saved.');
+      return;
+    }
+    if (!answer.trim()) {
+      if (recordedBlob) {
+        setError('Add a transcript, or transcribe the recording, before saving.');
+        return;
+      }
+      leaveInterview();
+      return;
+    }
+    if (!(await saveAnswer())) return;
+    leaveInterview();
+  }
+
+  function requestLeave() {
+    if (recording) {
+      setError('Stop the recording before leaving this question.');
+      return;
+    }
+    const current = selected?.questions?.[questionIndex];
+    const dirty = answer.trim() !== (current?.answer?.transcript ?? '').trim() || recordedBlob != null;
+    if (dirty) {
+      setConfirmLeave(true);
+      return;
+    }
+    leaveInterview();
   }
 
   async function logout() {
-    stopRecording();
+    abandonRecording();
     try {
       await authFetch(`${API_URL}/auth/logout`, { method: 'POST' });
     } catch {
@@ -408,12 +685,26 @@ function App() {
     setUser(null);
     setInterviews([]);
     setSelected(null);
+    setError('');
+    setInfo('');
+  }
+
+  if (booting) {
+    return (
+      <Frame className="boot-shell">
+        <header className="topbar">
+          <strong>InterviewSense</strong>
+          <span>AI Interview Coach</span>
+        </header>
+        <p className="boot-status" role="status">Loading your session…</p>
+      </Frame>
+    );
   }
 
   if (!user) {
     if (mode === 'forgot') {
       return (
-        <main className="shell auth-shell">
+        <Frame className="auth-shell">
           <header className="topbar">
             <strong>InterviewSense</strong>
             <span>AI Interview Coach</span>
@@ -440,14 +731,14 @@ function App() {
               <p className="form-intro">We will email you a link to reset your password if an account exists.</p>
               <label>
                 Email
-                <input type="email" required value={forgotEmail} onChange={(e) => setForgotEmail(e.target.value)} placeholder="you@example.com" />
+                <input type="email" required autoComplete="email" autoCapitalize="none" value={forgotEmail} onChange={(event) => setForgotEmail(event.target.value)} placeholder="you@example.com" />
               </label>
-              {error && <p className="error">{error}</p>}
-              {info && <p className="error" style={{ background: '#e9f5ec', color: '#1a4d2e', border: '1px solid #c3e6cb' }}>{info}</p>}
+              {error && <p className="error" role="alert">{error}</p>}
+              {info && <p className="notice" role="status">{info}</p>}
               {forgotResult?.resetToken && (
-                <div style={{ marginTop: '12px', padding: '10px', background: '#f0f4ff', borderRadius: '8px', fontSize: '12px', wordBreak: 'break-all' }}>
-                  <strong>Development reset token:</strong>
-                  <div style={{ marginTop: '6px', fontFamily: 'monospace' }}>{forgotResult.resetToken}</div>
+                <div className="dev-token">
+                  <strong>Development reset token</strong>
+                  <code>{forgotResult.resetToken}</code>
                   <button
                     type="button"
                     className="text-button"
@@ -455,7 +746,6 @@ function App() {
                       setResetToken(forgotResult.resetToken!);
                       setMode('reset');
                     }}
-                    style={{ marginTop: '8px' }}
                   >
                     Use this token to reset →
                   </button>
@@ -464,7 +754,7 @@ function App() {
               <button className="submit-button" disabled={loading}>
                 {loading ? 'Please wait…' : 'Send reset link →'}
               </button>
-              <div style={{ marginTop: '12px', display: 'flex', justifyContent: 'space-between', fontSize: '12px' }}>
+              <div className="spread">
                 <button type="button" className="text-button" onClick={() => setMode('login')}>
                   Back to log in
                 </button>
@@ -474,13 +764,13 @@ function App() {
               </div>
             </form>
           </section>
-        </main>
+        </Frame>
       );
     }
 
     if (mode === 'reset') {
       return (
-        <main className="shell auth-shell">
+        <Frame className="auth-shell">
           <header className="topbar">
             <strong>InterviewSense</strong>
             <span>AI Interview Coach</span>
@@ -507,18 +797,22 @@ function App() {
               <p className="form-intro">Paste the token from your reset link and set a new password.</p>
               <label>
                 Reset token
-                <input required value={resetToken} onChange={(e) => setResetToken(e.target.value)} placeholder="Paste token here" />
+                <input required autoComplete="one-time-code" value={resetToken} onChange={(event) => setResetToken(event.target.value)} placeholder="Paste token here" />
               </label>
-              <label>
-                New password
-                <input type="password" required minLength={8} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="At least 8 characters" />
-              </label>
-              {error && <p className="error">{error}</p>}
-              {info && <p className="error" style={{ background: '#e9f5ec', color: '#1a4d2e', border: '1px solid #c3e6cb' }}>{info}</p>}
+              <PasswordField
+                label="New password"
+                value={newPassword}
+                autoComplete="new-password"
+                shown={showPassword}
+                onToggle={() => setShowPassword((current) => !current)}
+                onChange={setNewPassword}
+              />
+              {error && <p className="error" role="alert">{error}</p>}
+              {info && <p className="notice" role="status">{info}</p>}
               <button className="submit-button" disabled={loading}>
                 {loading ? 'Please wait…' : 'Reset password →'}
               </button>
-              <div style={{ marginTop: '12px', display: 'flex', justifyContent: 'space-between', fontSize: '12px' }}>
+              <div className="spread">
                 <button type="button" className="text-button" onClick={() => setMode('login')}>
                   Back to log in
                 </button>
@@ -528,12 +822,12 @@ function App() {
               </div>
             </form>
           </section>
-        </main>
+        </Frame>
       );
     }
 
     return (
-      <main className="shell auth-shell">
+      <Frame className="auth-shell">
         <header className="topbar">
           <strong>InterviewSense</strong>
           <span>AI Interview Coach</span>
@@ -561,65 +855,88 @@ function App() {
             {mode === 'register' && (
               <label>
                 Name
-                <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Your name" />
+                <input autoComplete="name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Your name" />
               </label>
             )}
             <label>
               Email
-              <input type="email" required value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="you@example.com" />
+              <input type="email" required autoComplete="email" autoCapitalize="none" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="you@example.com" />
             </label>
-            <label>
-              Password
-              <input type="password" required minLength={8} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="At least 8 characters" />
-            </label>
+            <PasswordField
+              label="Password"
+              value={form.password}
+              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+              shown={showPassword}
+              onToggle={() => setShowPassword((current) => !current)}
+              onChange={(value) => setForm({ ...form, password: value })}
+            />
             {mode === 'login' && (
-              <div style={{ textAlign: 'right', marginTop: '8px' }}>
-                <button type="button" className="text-button" onClick={() => { setMode('forgot'); setError(''); setInfo(''); }} style={{ fontSize: '12px' }}>
+              <div className="right-link">
+                <button type="button" className="text-button" onClick={() => { setMode('forgot'); setError(''); setInfo(''); }}>
                   Forgot password?
                 </button>
               </div>
             )}
-            {error && <p className="error">{error}</p>}
-            {info && <p className="error" style={{ background: '#e9f5ec', color: '#1a4d2e', border: '1px solid #c3e6cb' }}>{info}</p>}
+            {error && <p className="error" role="alert">{error}</p>}
+            {info && <p className="notice" role="status">{info}</p>}
             <button className="submit-button" disabled={loading}>
               {loading ? 'Please wait…' : mode === 'login' ? 'Log in →' : 'Create account →'}
             </button>
             {mode === 'login' && (
-              <p style={{ textAlign: 'center', marginTop: '12px', fontSize: '12px', color: '#65716b' }}>
-                <button type="button" className="text-button" onClick={() => setMode('reset')} style={{ fontSize: '12px' }}>
+              <p className="center-note">
+                <button type="button" className="text-button" onClick={() => setMode('reset')}>
                   Have a reset token? Reset password
                 </button>
               </p>
             )}
           </form>
         </section>
-      </main>
+      </Frame>
     );
   }
 
-  if (selected?.questions) {
+  if (selected?.questions?.length) {
     const question = selected.questions[questionIndex];
-    const savedAnalyses = question.answer?.analyses ?? [];
+    const savedAnalyses = question?.answer?.analyses ?? [];
     const speech = savedAnalyses.find((item) => item.kind === 'SPEECH_FLUENCY');
     const voice = savedAnalyses.find((item) => item.kind === 'VOICE_DELIVERY');
     const answerScore =
       speech?.score != null && voice?.score != null ? Math.round(speech.score * 0.4 + voice.score * 0.6) : speech?.score ?? voice?.score;
+    const isLast = questionIndex === selected.questions.length - 1;
+    const completed = selected.status === 'COMPLETED';
+    const primaryLabel = isLast ? (completed ? 'Update report →' : 'Complete interview →') : 'Save and continue →';
     return (
-      <main className="shell">
+      <Frame>
         <header className="topbar">
           <strong>InterviewSense</strong>
-          <button className="text-button" onClick={() => setSelected(null)}>
+          <button type="button" className="text-button" onClick={requestLeave}>
             ← Dashboard
           </button>
         </header>
         <section className="interview-screen">
           <p className="eyebrow">
             {selected.title} · QUESTION {questionIndex + 1} OF {selected.questions.length}
+            {completed ? ' · REVIEW' : ''}
           </p>
-          <div className="progress">
+          <div className="progress" aria-hidden="true">
             <span style={{ width: `${((questionIndex + 1) / selected.questions.length) * 100}%` }} />
           </div>
-          {selected.status === 'COMPLETED' && selected.report?.summary && (
+          <nav className="question-nav" aria-label="Questions">
+            {selected.questions.map((item, index) => (
+              <button
+                key={item.id}
+                type="button"
+                className={`question-dot plain-button${index === questionIndex ? ' current' : ''}${item.answer?.transcript?.trim() ? ' answered' : ''}`}
+                aria-label={`Question ${index + 1}${item.answer?.transcript?.trim() ? ', answered' : ''}`}
+                aria-current={index === questionIndex ? 'step' : undefined}
+                disabled={saving}
+                onClick={() => goToQuestion(index)}
+              >
+                {index + 1}
+              </button>
+            ))}
+          </nav>
+          {completed && selected.report?.summary && (
             <div className="report-panel">
               <p className="eyebrow">INTERVIEW REPORT</p>
               <h2>{selected.report.overallScore != null ? `${selected.report.overallScore}/100` : 'Report ready'}</h2>
@@ -628,13 +945,13 @@ function App() {
                 {!!selected.report.details?.strengths?.length && (
                   <div>
                     <b>Strengths</b>
-                    <ul>{selected.report.details.strengths.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                    <ul>{selected.report.details.strengths.map((item) => <li key={item}>{item}</li>)}</ul>
                   </div>
                 )}
                 {!!selected.report.details?.improvements?.length && (
                   <div>
                     <b>Next steps</b>
-                    <ul>{selected.report.details.improvements.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                    <ul>{selected.report.details.improvements.map((item) => <li key={item}>{item}</li>)}</ul>
                   </div>
                 )}
               </div>
@@ -643,17 +960,21 @@ function App() {
               )}
             </div>
           )}
-          <h1>{question.text}</h1>
-          <p className="form-intro">Answer by typing or record yourself using your camera and microphone.</p>
+          <h1>{question?.text}</h1>
+          <p className="form-intro">
+            {completed
+              ? 'Review this answer, or edit it and update the report.'
+              : 'Answer by typing or record yourself using your camera and microphone.'}
+          </p>
           <div className="recorder-card">
-            <div className="camera-placeholder">
+            <div className={`camera-placeholder${recording ? ' live' : ''}`}>
               {recording ? (
                 <video ref={videoPreview} muted playsInline />
               ) : recordedUrl ? (
                 <video src={recordedUrl} controls />
               ) : (
                 <>
-                  <span>◉</span>
+                  <span aria-hidden="true">◉</span>
                   <p>Camera preview will appear in your recording</p>
                 </>
               )}
@@ -668,17 +989,20 @@ function App() {
                   ■ Stop recording
                 </button>
               )}
-              {recordedUrl && (
-                <>
-                  <small>Recording ready ({Math.round(recordingDuration / 1000)}s)</small>
-                  <button type="button" className="transcribe-button" onClick={transcribeRecording} disabled={transcribing}>
-                    {transcribing ? 'Transcribing…' : 'Transcribe recording'}
-                  </button>
-                </>
+              {(recording || recordedUrl) && (
+                <small role="status">{recording ? `Recording ${formatDuration(recordingDuration)}` : `Recording ready (${formatDuration(recordingDuration)})`}</small>
+              )}
+              {recordedUrl && !recording && (
+                <button type="button" className="transcribe-button" onClick={transcribeRecording} disabled={transcribing || saving}>
+                  {transcribing ? 'Transcribing…' : 'Transcribe recording'}
+                </button>
               )}
             </div>
           </div>
-          <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="Write your answer here…" />
+          <label className="sr-only" htmlFor="answer">
+            Your answer
+          </label>
+          <textarea id="answer" value={answer} onChange={(event) => { setAnswer(event.target.value); setConfirmLeave(false); }} placeholder="Write your answer here…" />
           {savedAnalyses.length > 0 && (() => {
             const metrics = speech?.details?.metrics ?? {};
             const voiceMetricsDetails = voice?.details?.metrics ?? {};
@@ -715,35 +1039,60 @@ function App() {
                 </div>
                 {limitations.length > 0 && (
                   <ul className="limitations">
-                    {limitations.map((limitation, index) => (
-                      <li key={index}>{limitation}</li>
+                    {limitations.map((limitation) => (
+                      <li key={limitation}>{limitation}</li>
                     ))}
                   </ul>
                 )}
               </div>
             );
           })()}
+          {confirmLeave && (
+            <p className="notice" role="status">
+              This answer has unsaved changes.
+              <button type="button" className="text-button danger" onClick={leaveInterview}>Discard</button>
+              <button type="button" className="text-button" onClick={() => setConfirmLeave(false)}>Keep editing</button>
+            </p>
+          )}
           <div className="interview-actions">
-            <button className="text-button" onClick={saveAndExit}>
-              Save and exit
+            <div className="action-group">
+              {questionIndex > 0 && (
+                <button type="button" className="text-button" onClick={() => goToQuestion(questionIndex - 1)} disabled={saving}>
+                  ← Previous
+                </button>
+              )}
+              <button type="button" className="text-button" onClick={saveAndExit} disabled={saving}>
+                Save and exit
+              </button>
+            </div>
+            <button type="button" onClick={nextQuestion} disabled={saving}>
+              {saving ? 'Saving…' : primaryLabel}
             </button>
-            <button onClick={nextQuestion}>{questionIndex === selected.questions.length - 1 ? 'Complete interview →' : 'Save and continue →'}</button>
           </div>
-          {error && <p className="error">{error}</p>}
+          {error && <p className="error" role="alert">{error}</p>}
         </section>
-      </main>
+      </Frame>
     );
   }
 
+  const resumeTarget = interviews.find((interview) => interview.status === 'IN_PROGRESS');
+  const average = meanScore(interviews);
+  const inProgress = interviews.filter((interview) => interview.status === 'IN_PROGRESS').length;
+  const scoreSeries = interviews
+    .filter((interview) => interview.status === 'COMPLETED' && interview.report?.overallScore != null)
+    .slice()
+    .reverse()
+    .slice(-12);
+
   return (
-    <main className="shell dashboard-shell">
+    <Frame className="dashboard-shell">
       <header className="topbar">
         <strong>InterviewSense</strong>
-        <button className="text-button" onClick={logout}>
+        <button type="button" className="text-button" onClick={logout}>
           Log out
         </button>
       </header>
-      <section className="dashboard-welcome">
+      <section className="dashboard-welcome compact">
         <p className="eyebrow">YOUR DASHBOARD</p>
         <h1>
           Welcome back,
@@ -751,7 +1100,52 @@ function App() {
           <em>{user.name || user.email.split('@')[0]}.</em>
         </h1>
         <p className="lede">Practice realistic interviews and build confidence with measurable feedback.</p>
+        {resumeTarget && (
+          <button type="button" className="continue-button" onClick={() => openInterview(resumeTarget)} disabled={openingId === resumeTarget.id}>
+            {openingId === resumeTarget.id ? 'Opening…' : <>Continue {resumeTarget.title} <span>→</span></>}
+          </button>
+        )}
       </section>
+      <section className="dashboard-grid" aria-label="Progress summary">
+        <article>
+          <b>{interviewsReady ? interviews.length : '—'}</b>
+          <h2>Sessions</h2>
+          <p>Mock interviews started in your lab.</p>
+        </article>
+        <article>
+          <b>{interviewsReady ? (average ?? '—') : '—'}</b>
+          <h2>Average score</h2>
+          <p>Mean overall score across completed sessions.</p>
+        </article>
+        <article>
+          <b>{interviewsReady ? inProgress : '—'}</b>
+          <h2>In progress</h2>
+          <p>Pick up where you left off.</p>
+        </article>
+      </section>
+      {scoreSeries.length > 0 && (
+        <section className="trend">
+          <div className="section-heading">
+            <p className="eyebrow">TREND</p>
+            <h2>Score history</h2>
+          </div>
+          <div className="trend-chart" role="list" aria-label="Completed interview scores, oldest to newest">
+            {scoreSeries.map((interview) => (
+              <div className="trend-slot" role="listitem" key={interview.id}>
+                <button
+                  type="button"
+                  className="trend-bar plain-button"
+                  style={{ height: `${Math.max(18, interview.report?.overallScore ?? 0)}%` }}
+                  aria-label={`${interview.title}, ${interview.report?.overallScore} out of 100`}
+                  onClick={() => openInterview(interview)}
+                >
+                  {interview.report?.overallScore}
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       <section className="create-panel">
         <div>
           <p className="eyebrow">NEW SESSION</p>
@@ -759,39 +1153,63 @@ function App() {
           <p>Choose a focus and we will prepare your first questions.</p>
         </div>
         <form onSubmit={createInterview}>
-          <input required value={interviewForm.title} onChange={(e) => setInterviewForm({ ...interviewForm, title: e.target.value })} placeholder="Interview title" />
-          <input value={interviewForm.role} onChange={(e) => setInterviewForm({ ...interviewForm, role: e.target.value })} placeholder="Target role (optional)" />
+          <input required value={interviewForm.title} onChange={(event) => setInterviewForm({ ...interviewForm, title: event.target.value })} placeholder="Interview title" aria-label="Interview title" />
+          <input value={interviewForm.role} onChange={(event) => setInterviewForm({ ...interviewForm, role: event.target.value })} placeholder="Target role (optional)" aria-label="Target role" />
           <button disabled={loading}>{loading ? 'Creating…' : 'Create session →'}</button>
         </form>
       </section>
-      {error && <p className="error">{error}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
       <section className="history">
         <div className="section-heading">
           <p className="eyebrow">PROGRESS</p>
           <h2>Your interviews</h2>
         </div>
-        {interviews.length === 0 ? (
-          <div className="empty-state">Your interview history will appear here after you create your first session.</div>
+        {!interviewsReady ? (
+          <div className="empty-state" role="status">Loading your interviews…</div>
+        ) : interviews.length === 0 ? (
+          <div className="empty-state">No sessions yet. Start a mock interview above — your scores and history will collect here.</div>
         ) : (
           <div className="interview-list">
-            {interviews.map((i) => (
-              <article className="interview-row" key={i.id} onClick={() => openInterview(i)}>
-                <div>
-                  <b>{i.title}</b>
-                  <p>
-                    {i.role || 'General interview'} · {i._count?.questions ?? 0} questions
-                  </p>
-                </div>
-                <span style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  {i.report?.overallScore != null && <span className="score-chip">{i.report.overallScore}/100</span>}
-                  <span className={`status ${i.status.toLowerCase()}`}>{i.status.replace('_', ' ')}</span>
-                </span>
-              </article>
-            ))}
+            {interviews.map((interview) => {
+              const total = interview._count?.questions ?? interview.questions?.length ?? 0;
+              const answered = interview.answeredCount;
+              const progressLabel = interview.status === 'COMPLETED' || answered == null
+                ? `${total} questions`
+                : `${answered}/${total} answered`;
+              return (
+                <article className="interview-row" key={interview.id}>
+                  <button type="button" className="plain-button row-main" onClick={() => openInterview(interview)} disabled={openingId === interview.id}>
+                    <b>{interview.title}</b>
+                    <p>
+                      {interview.role || 'General interview'} · {progressLabel}
+                      {interview.createdAt ? ` · ${formatWhen(interview.createdAt)}` : ''}
+                    </p>
+                  </button>
+                  <div className="row-side">
+                    {interview.report?.overallScore != null && <span className="score-chip">{interview.report.overallScore}/100</span>}
+                    <span className={`status ${interview.status.toLowerCase()}`}>{interview.status.replace('_', ' ')}</span>
+                    {pendingDelete === interview.id ? (
+                      <>
+                        <button type="button" className="text-button danger" onClick={() => removeInterview(interview.id)} disabled={loading}>
+                          Confirm
+                        </button>
+                        <button type="button" className="text-button" onClick={() => setPendingDelete(null)}>
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button type="button" className="text-button" onClick={() => setPendingDelete(interview.id)} aria-label={`Delete ${interview.title}`}>
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </section>
-    </main>
+    </Frame>
   );
 }
 

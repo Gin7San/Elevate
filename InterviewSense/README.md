@@ -18,6 +18,10 @@ AI-powered mock interviews with recording, transcription, and multimodal confide
 2. **Voice delivery calibration.** `voice.ts` scores energy, consistency, pitch variation, and pause behavior against named calibration targets (`VOICE_CALIBRATION_DEFAULTS`). Calibration protocol: record 20–30 pilot sessions with at least two microphone setups, have 2+ reviewers rate perceived delivery confidence, then adjust the targets — deployed values can be overridden without redeploys via `VOICE_CALIBRATION_JSON` (validated against a strict schema). Metrics and limitations are stored in `AnalysisResult.details` and surfaced in the UI under each answer's analysis panel.
 3. **Report generation.** `POST /api/v1/interviews/:id/complete` scores the interview and builds a `FeedbackReport` with a narrative `summary`, `strengths`, and `improvements`. With `OPENAI_API_KEY` set (model via `OPENAI_REPORT_MODEL`, default `gpt-4o-mini`) the summary is LLM-written; otherwise a deterministic offline summary is derived from the recorded analyses. The UI renders the report on the completed interview screen and the score on the dashboard history.
 
+## In the product
+
+The dashboard summarizes sessions, average score, and interviews still in progress, and charts completed scores. Opening an in-progress interview resumes at the first unanswered question. Completed interviews open in review: move between questions, edit an answer, and update the report. Sessions can be deleted from the history list; stored recordings are removed with them. The recorder shows a live timer and asks you to stop before leaving mid-recording.
+
 ## Local setup
 
 Requirements: Node.js 22+, npm, Docker, and Docker Compose.
@@ -129,7 +133,7 @@ The compose stack builds production images for the backend (applies migrations o
 - The SPA session lives in a HttpOnly, SameSite=Strict cookie (`Secure` in production); nothing is stored in local storage. Bearer-token access remains available for API clients. State-changing cookie requests must echo the `interviewsense_csrf` cookie in an `X-CSRF-Token` header (double-submit CSRF protection) and `POST /api/v1/auth/logout` clears the session.
 - Password reset uses `POST /api/v1/auth/forgot-password` to create a one-hour, hashed single-use token and `POST /api/v1/auth/reset-password` to set a new password. Tokens are hashed with SHA-256 and cleared after use or expiry. With `SMTP_URL` configured the reset link is emailed and never exposed in the API response; without it, the token is returned in the response as a development fallback. The endpoint is rate limited (10 attempts per 15 minutes per IP, 3 per hour per account).
 - The API refuses to start with a missing, short, or known-placeholder JWT secret.
-- Recording uploads are authenticated, MIME-filtered, and limited to 25 MB.
+- Recording uploads are authenticated, MIME-filtered, and limited to 25 MB. Deleting a session removes its questions, analyses, report, and any stored recordings.
 - Recordings are private: there is no public static route. The API issues short-lived HMAC-signed media URLs (`/api/v1/media/...`, TTL via `MEDIA_URL_TTL_SECONDS`) signed with `JWT_SECRET`, served with `nosniff`, CSP, and no-store headers. Production deployments should move the backing store to private object storage with presigned URLs — the API/SPA contract stays the same.
 - Production deployments should additionally use HTTPS everywhere, rate limiting at the edge, and managed secrets.
 
