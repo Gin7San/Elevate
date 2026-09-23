@@ -9,6 +9,7 @@ import { toSignedMediaUrl } from '../lib/mediaSign.js';
 import { analyzeSpeech } from '../services/confidence.js';
 import { analyzeVoice, voiceMetricsSchema } from '../services/voice.js';
 import { pauseAnalysisSchema } from '../services/transcription.js';
+import { isPlausibleMediaType, readMediaTypeHead, resolveMediaType } from '../lib/mediaType.js';
 import { generateReportSummary } from '../services/report.js';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth.js';
 
@@ -16,16 +17,16 @@ const router = Router();
 const uploadsPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../uploads');
 await fs.mkdir(uploadsPath, { recursive: true });
 
-const acceptedMediaTypes = new Set([
-  'video/webm', 'video/mp4', 'audio/webm', 'audio/mp4',
-  'audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/ogg'
-]);
 const upload = multer({
   dest: uploadsPath,
   // questionId, transcript, durationMs, voiceMetrics, pauseAnalysis + margin
   limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 6, parts: 8 },
+  // Browsers declare the full MediaRecorder type (`video/webm;codecs=vp8,opus`),
+  // which busboy cannot parse and reports as `text/plain`. The declared type is
+  // therefore only rejected here when it contradicts the allow-list; otherwise
+  // the handler below decides using the stored file's own bytes.
   fileFilter: (_req, file, callback) => {
-    if (acceptedMediaTypes.has(file.mimetype)) callback(null, true);
+    if (isPlausibleMediaType(file.mimetype)) callback(null, true);
     else callback(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'media'));
   }
 });
@@ -147,6 +148,16 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
   if (!req.userId) {
     await removeUpload(newMediaUrl);
     return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  // The declared type is unverifiable for browser recordings (see the fileFilter
+  // note above), so the stored bytes decide whether this is a supported recording.
+  if (req.file) {
+    const mediaType = resolveMediaType(req.file.mimetype, await readMediaTypeHead(req.file.path));
+    if (!mediaType) {
+      await removeUpload(newMediaUrl);
+      return res.status(415).json({ error: 'The recording format is not supported. Record again in the browser, or upload a WebM, MP4, WAV, OGG or MP3 file.' });
+    }
   }
 
   const parsed = answerSchema.safeParse({

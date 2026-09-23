@@ -12,6 +12,10 @@ type AuthResponse = { user: User; token?: string; csrfToken?: string };
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ?? '/api/v1';
 const MEDIA_URL = (import.meta.env.VITE_MEDIA_URL as string | undefined)?.replace(/\/$/, '') ?? '';
 const CSRF_COOKIE = 'interviewsense_csrf';
+/** How often MediaRecorder emits a chunk, and therefore how often live captions refresh. */
+const LIVE_CAPTION_INTERVAL_MS = 8_000;
+const TRANSCRIBE_POLL_INTERVAL_MS = 1_500;
+const TRANSCRIBE_POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
 function getCookieValue(name: string): string {
   const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
@@ -123,6 +127,14 @@ function App() {
   const recordingStartedAt = useRef(0);
   const savingRef = useRef(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
+  // Live captions: a partial transcript is fetched while recording so the
+  // candidate can see what the microphone is actually picking up. Each poll
+  // re-sends the audio recorded so far, so it costs transcription calls.
+  const [liveCaption, setLiveCaption] = useState('');
+  const [liveCaptionsEnabled, setLiveCaptionsEnabled] = useState(true);
+  const liveRequestInFlight = useRef(false);
+  const liveAborted = useRef(false);
+  const transcribeAbort = useRef<AbortController | null>(null);
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const [interviewForm, setInterviewForm] = useState({ title: '', role: '' });
   const [error, setError] = useState('');
@@ -217,7 +229,11 @@ function App() {
     if (recordedUrl.startsWith('blob:')) URL.revokeObjectURL(recordedUrl);
   }, [recordedUrl]);
 
-  useEffect(() => () => mediaStream.current?.getTracks().forEach((track) => track.stop()), []);
+  useEffect(() => () => {
+    mediaStream.current?.getTracks().forEach((track) => track.stop());
+    liveAborted.current = true;
+    transcribeAbort.current?.abort();
+  }, []);
 
   useEffect(() => {
     const current = selected?.questions?.[questionIndex];
@@ -581,6 +597,23 @@ function App() {
     showQuestion(selected, index);
   }
 
+  /** The question being answered, used to prime the transcription vocabulary. */
+  function currentQuestionText(): string | undefined {
+    return selected?.questions?.[questionIndex]?.text;
+  }
+
+  /** Concatenates the chunks recorded so far into a playable blob. */
+  function buildRecordingBlob(): Blob | null {
+    if (recordedChunks.current.length === 0) return null;
+    // MediaRecorder reports its resolved type with codec parameters, e.g.
+    // `video/webm;codecs=vp8,opus`. A comma in an unquoted Content-Type
+    // parameter is not valid, so the server's multipart parser drops that
+    // header and sees the recording as text/plain. Narrowing the Blob type
+    // to the media type keeps the upload identifiable server-side.
+    const recordedType = (mediaRecorder.current?.mimeType || recordedChunks.current[0]?.type || '').split(';')[0].trim();
+    return new Blob(recordedChunks.current, { type: recordedType || 'video/webm' });
+  }
+
   async function startRecording() {
     setError('');
     try {
@@ -589,19 +622,25 @@ function App() {
       recordedChunks.current = [];
       const mimeType = MediaRecorder.isTypeSupported('video/webm') ? 'video/webm' : '';
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      liveAborted.current = false;
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) recordedChunks.current.push(event.data);
+        if (liveCaptionsEnabled && recorder.state === 'recording') void requestLiveCaption();
       };
       recorder.onstop = () => {
-        const blob = new Blob(recordedChunks.current, { type: recorder.mimeType || recordedChunks.current[0]?.type || 'video/webm' });
-        setRecordedBlob(blob);
-        setRecordedUrl(URL.createObjectURL(blob));
+        const blob = buildRecordingBlob();
+        if (blob) {
+          setRecordedBlob(blob);
+          setRecordedUrl(URL.createObjectURL(blob));
+        }
         setRecordingDuration(Date.now() - recordingStartedAt.current);
         stream.getTracks().forEach((track) => track.stop());
       };
       mediaRecorder.current = recorder;
       recordingStartedAt.current = Date.now();
-      recorder.start();
+      setLiveCaption('');
+      // A timeslice yields periodic chunks, which is what makes live captions possible.
+      recorder.start(LIVE_CAPTION_INTERVAL_MS);
       setRecording(true);
       setRecordingDuration(0);
     } catch (cause) {
@@ -615,32 +654,84 @@ function App() {
   }
 
   function stopRecording() {
+    liveAborted.current = true;
     if (mediaRecorder.current?.state === 'recording') {
       mediaRecorder.current.stop();
       setRecording(false);
     }
+    setLiveCaption('');
   }
 
+  /**
+   * Fetches a partial transcript of everything recorded so far. Requests never
+   * overlap: a slow round-trip simply means the next caption arrives later,
+   * rather than a pile of uploads competing for the same audio.
+   */
+  async function requestLiveCaption() {
+    if (liveRequestInFlight.current || liveAborted.current) return;
+    const blob = buildRecordingBlob();
+    if (!blob || blob.size === 0) return;
+    liveRequestInFlight.current = true;
+    try {
+      const payload = new FormData();
+      payload.append('media', blob, 'live.webm');
+      payload.append('live', '1');
+      const prompt = currentQuestionText();
+      if (prompt) payload.append('prompt', prompt);
+      const response = await authFetch(`${API_URL}/transcription`, { method: 'POST', body: payload });
+      if (!response.ok || liveAborted.current) return;
+      const data = await response.json();
+      if (typeof data.transcript === 'string' && data.transcript.trim()) setLiveCaption(data.transcript.trim());
+    } catch {
+      // Live captions are best-effort; the final transcript is the one that matters.
+    } finally {
+      liveRequestInFlight.current = false;
+    }
+  }
+
+  async function pollTranscriptionJob(jobId: string): Promise<{ transcript: string; pauseAnalysis?: PauseAnalysis | null }> {
+    const deadline = Date.now() + TRANSCRIBE_POLL_TIMEOUT_MS;
+    for (;;) {
+      const response = await authFetch(`${API_URL}/transcription/jobs/${jobId}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error ?? 'Transcription failed');
+      if (data.state === 'completed') return data;
+      if (data.state === 'failed') throw new Error(data.error ?? 'Transcription failed');
+      if (Date.now() > deadline) throw new Error('Transcription is taking longer than expected. Please try again.');
+      await new Promise((resolve) => setTimeout(resolve, TRANSCRIBE_POLL_INTERVAL_MS));
+    }
+  }
+
+  /**
+   * Queues the recording as a server-side job and polls it. A long answer can
+   * take longer than a proxy holds a single request open, and polling also lets
+   * the UI show progress instead of a spinner with no upper bound.
+   */
   async function transcribeRecording() {
     if (!recordedBlob) return;
     setError('');
     setTranscribing(true);
+    transcribeAbort.current?.abort();
+    const controller = new AbortController();
+    transcribeAbort.current = controller;
     const payload = new FormData();
     payload.append('media', recordedBlob, 'answer.webm');
+    const prompt = currentQuestionText();
+    if (prompt) payload.append('prompt', prompt);
     try {
-      const response = await authFetch(`${API_URL}/transcription`, {
-        method: 'POST',
-        body: payload
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error ?? 'Transcription failed');
+      const queued = await authFetch(`${API_URL}/transcription/jobs`, { method: 'POST', body: payload, signal: controller.signal });
+      const queueData = await queued.json();
+      if (!queued.ok) throw new Error(queueData.error ?? 'Transcription failed');
+      const data = await pollTranscriptionJob(queueData.jobId);
+      if (controller.signal.aborted) return;
       setAnswer(data.transcript);
       // Server-derived pause metrics (word timestamps) flow into fluency scoring.
       setPauseMetrics(data.pauseAnalysis ?? null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Transcription failed');
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Transcription failed');
     } finally {
       setTranscribing(false);
+      transcribeAbort.current = null;
     }
   }
 
@@ -997,7 +1088,21 @@ function App() {
                   {transcribing ? 'Transcribing…' : 'Transcribe recording'}
                 </button>
               )}
+              <label className={`caption-toggle${recording ? ' locked' : ''}`} title={recording ? 'Live captions cannot be changed mid-recording' : undefined}>
+                <input
+                  type="checkbox"
+                  checked={liveCaptionsEnabled}
+                  disabled={recording}
+                  onChange={(event) => setLiveCaptionsEnabled(event.target.checked)}
+                />
+                Live captions
+              </label>
             </div>
+            {recording && liveCaptionsEnabled && (
+              <p className="live-caption" role="status" aria-live="polite">
+                {liveCaption || 'Listening… your words will appear here as you speak.'}
+              </p>
+            )}
           </div>
           <label className="sr-only" htmlFor="answer">
             Your answer

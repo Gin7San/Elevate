@@ -46,12 +46,21 @@ app.use('/api/v1/transcription', transcriptionRouter);
 app.use('/api/v1/media', mediaRouter);
 
 app.use((_req, res) => res.status(404).json({ error: 'Route not found' }));
+
+// Multer reports every malformed upload as a MulterError, so each code needs its
+// own message; a single generic one leaves users guessing what to change.
+const multerMessages: Record<string, string> = {
+  LIMIT_FILE_SIZE: 'The recording must be 25 MB or smaller',
+  LIMIT_FILE_COUNT: 'Only one recording can be uploaded at a time',
+  LIMIT_UNEXPECTED_FILE: 'Only a recording in the "media" field is accepted',
+  LIMIT_FIELD_COUNT: 'The request contains too many fields',
+  LIMIT_FIELD_VALUE: 'A form field value is too large',
+  LIMIT_PART_COUNT: 'The request contains too many parts'
+};
+
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (error instanceof multer.MulterError) {
-    const message = error.code === 'LIMIT_FILE_SIZE'
-      ? 'The recording must be 25 MB or smaller'
-      : 'The recording upload is invalid';
-    return res.status(400).json({ error: message });
+    return res.status(400).json({ error: multerMessages[error.code] ?? 'The recording upload is invalid' });
   }
   console.error(error);
   return res.status(500).json({ error: 'An unexpected server error occurred' });

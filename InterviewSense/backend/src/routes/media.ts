@@ -1,9 +1,9 @@
 import { Router } from 'express';
 import fs from 'node:fs';
-import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyMediaSignature } from '../lib/mediaSign.js';
+import { readMediaTypeHead, sniffContentType } from '../lib/mediaType.js';
 
 const router = Router();
 const uploadsPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../uploads');
@@ -16,16 +16,6 @@ const uploadsPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
  * swap the local disk backend for private object storage; the signed-URL
  * contract between API and SPA stays the same (presigned URLs there).
  */
-function sniffContentType(head: Buffer): string {
-  if (head.length >= 4 && head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return 'video/webm';
-  if (head.length >= 12 && head.toString('ascii', 4, 8) === 'ftyp') return 'video/mp4';
-  if (head.length >= 4 && head.toString('ascii', 0, 4) === 'OggS') return 'audio/ogg';
-  if (head.length >= 4 && head.toString('ascii', 0, 4) === 'RIFF') return 'audio/wav';
-  if (head.length >= 3 && head.toString('ascii', 0, 3) === 'ID3') return 'audio/mpeg';
-  if (head.length >= 2 && head[0] === 0xff && (head[1] & 0xe0) === 0xe0) return 'audio/mpeg';
-  return 'application/octet-stream';
-}
-
 router.get('/:filename', async (req, res) => {
   const filename = req.params.filename;
   const eRaw = typeof req.query.e === 'string' ? req.query.e : '';
@@ -39,10 +29,8 @@ router.get('/:filename', async (req, res) => {
 
   const filePath = path.join(uploadsPath, filename);
   try {
-    const handle = await fsp.open(filePath, 'r');
-    const head = Buffer.alloc(16);
-    await handle.read(head, 0, 16, 0);
-    await handle.close();
+    const head = await readMediaTypeHead(filePath);
+    if (head.length === 0) throw new Error('unreadable');
     res.setHeader('Content-Type', sniffContentType(head));
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'none'; media-src 'self'");

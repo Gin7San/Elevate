@@ -14,7 +14,7 @@ AI-powered mock interviews with recording, transcription, and multimodal confide
 
 ## Analysis pipeline
 
-1. **Timestamped transcription.** `POST /api/v1/transcription` calls Whisper with `response_format: verbose_json` and `timestamp_granularities: ['word']`. The response includes a server-derived pause analysis (pause count, long pauses ≥ 2 s, total/longest pause durations, spoken-span speaking rate). The SPA attaches it to the answer, so `confidence.ts` computes fluency from filler rate **and** real pauses; without it, the response explicitly lists that limitation in `AnalysisResult.details.limitations`.
+1. **Timestamped transcription.** `POST /api/v1/transcription` (and its asynchronous twin, `POST /api/v1/transcription/jobs` + `GET /api/v1/transcription/jobs/:id`) calls Whisper with `response_format: verbose_json` and `timestamp_granularities: ['word']` through any OpenAI-compatible endpoint. The interview question is sent as `prompt` so Whisper's vocabulary is primed for the domain being discussed, and the upload is re-encoded to 16 kHz mono audio with ffmpeg first when available. The response includes a server-derived pause analysis (pause count, long pauses ≥ 2 s, total/longest pause durations, spoken-span speaking rate). The SPA attaches it to the answer, so `confidence.ts` computes fluency from filler rate **and** real pauses; without it, the response explicitly lists that limitation in `AnalysisResult.details.limitations`. Identical audio is served from a content-addressed cache, both endpoints are rate limited per user, and while recording the SPA polls for live captions.
 2. **Voice delivery calibration.** `voice.ts` scores energy, consistency, pitch variation, and pause behavior against named calibration targets (`VOICE_CALIBRATION_DEFAULTS`). Calibration protocol: record 20–30 pilot sessions with at least two microphone setups, have 2+ reviewers rate perceived delivery confidence, then adjust the targets — deployed values can be overridden without redeploys via `VOICE_CALIBRATION_JSON` (validated against a strict schema). Metrics and limitations are stored in `AnalysisResult.details` and surfaced in the UI under each answer's analysis panel.
 3. **Report generation.** `POST /api/v1/interviews/:id/complete` scores the interview and builds a `FeedbackReport` with a narrative `summary`, `strengths`, and `improvements`. With `OPENAI_API_KEY` set (model via `OPENAI_REPORT_MODEL`, default `gpt-4o-mini`) the summary is LLM-written; otherwise a deterministic offline summary is derived from the recorded analyses. The UI renders the report on the completed interview screen and the score on the dashboard history.
 
@@ -59,7 +59,7 @@ Requirements: Node.js 22+, npm, Docker, and Docker Compose.
    npm run prisma --prefix backend -- migrate dev
    ```
 
-6. Optionally add `OPENAI_API_KEY` to `backend/.env` to enable recording transcription.
+6. Optionally add `OPENAI_API_KEY` to `backend/.env` to enable recording transcription. Any OpenAI-compatible endpoint works — set `OPENAI_BASE_URL` (for example `https://api.groq.com/openai/v1` with `OPENAI_TRANSCRIBE_MODEL=whisper-large-v3-turbo`). Installing `ffmpeg` (`apt install ffmpeg`, `brew install ffmpeg`) lets the API shrink each upload to 16 kHz mono audio first; without it the original recording is sent upstream instead.
 
 7. Start both applications:
 
@@ -84,7 +84,17 @@ The Vite development server proxies `/api` and `/uploads` to the backend, so bro
 | `PORT` | No | API port; defaults to `4000` |
 | `CLIENT_URL` | No | Comma-separated allowed browser origins; defaults to `http://localhost:5173` |
 | `OPENAI_API_KEY` | No | Enables Whisper transcription and LLM-written report summaries |
+| `OPENAI_BASE_URL` | No | OpenAI-compatible base URL for transcription (Groq, Deepgram, a self-hosted whisper-server); defaults to OpenAI |
+| `TRANSCRIPTION_BASE_URL` | No | Overrides `OPENAI_BASE_URL` for transcription only |
+| `TRANSCRIPTION_PROVIDER` | No | `openai` (default) or `none` to disable transcription |
 | `OPENAI_TRANSCRIBE_MODEL` | No | Whisper model name; defaults to `whisper-1` |
+| `TRANSCRIPTION_TIMEOUT_MS` | No | Per-call upstream timeout; defaults to `60000` |
+| `TRANSCRIPTION_MAX_RETRIES` | No | Upstream retries (0–5); defaults to `2` |
+| `TRANSCRIPTION_CACHE_TTL_SECONDS` | No | How long an identical recording is served from cache (0 disables); defaults to `3600` |
+| `TRANSCRIPTION_EXTRACT_AUDIO` | No | Re-encode uploads to 16 kHz mono WAV with ffmpeg; defaults to `true` |
+| `FFMPEG_PATH` | No | ffmpeg binary path; defaults to `ffmpeg` |
+| `TRANSCRIPTION_RATE_LIMIT_MAX` | No | Final transcriptions per user per 15 minutes; defaults to `20` |
+| `TRANSCRIPTION_LIVE_RATE_LIMIT_MAX` | No | Live-caption polls per user per 15 minutes; defaults to `240` |
 | `OPENAI_REPORT_MODEL` | No | Chat model for report summaries; defaults to `gpt-4o-mini` |
 | `VOICE_CALIBRATION_JSON` | No | JSON overrides for voice scoring calibration targets |
 | `SMTP_URL` | No | SMTP connection string; enables email delivery of password-reset links |
