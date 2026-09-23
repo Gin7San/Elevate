@@ -9,7 +9,10 @@ import { toSignedMediaUrl } from '../lib/mediaSign.js';
 import { analyzeSpeech } from '../services/confidence.js';
 import { analyzeVoice, voiceMetricsSchema } from '../services/voice.js';
 import { pauseAnalysisSchema } from '../services/transcription.js';
-import { isPlausibleMediaType, readMediaTypeHead, resolveMediaType } from '../lib/mediaType.js';
+import { generateInterviewQuestions } from '../services/questions.js';
+import { analyzeAnswerContent } from '../services/answerContent.js';
+import { analyzeCameraPresence, cameraMetricsSchema } from '../services/camera.js';
+import { calculateAnswerScores, calculateSessionOverallScore } from '../services/scoring.js';
 import { generateReportSummary } from '../services/report.js';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth.js';
 
@@ -19,12 +22,8 @@ await fs.mkdir(uploadsPath, { recursive: true });
 
 const upload = multer({
   dest: uploadsPath,
-  // questionId, transcript, durationMs, voiceMetrics, pauseAnalysis + margin
-  limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 6, parts: 8 },
-  // Browsers declare the full MediaRecorder type (`video/webm;codecs=vp8,opus`),
-  // which busboy cannot parse and reports as `text/plain`. The declared type is
-  // therefore only rejected here when it contradicts the allow-list; otherwise
-  // the handler below decides using the stored file's own bytes.
+  // questionId, transcript, durationMs, voiceMetrics, pauseAnalysis, cameraMetrics + margin
+  limits: { fileSize: 25 * 1024 * 1024, files: 1, fields: 8, parts: 10 },
   fileFilter: (_req, file, callback) => {
     if (isPlausibleMediaType(file.mimetype)) callback(null, true);
     else callback(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'media'));
@@ -44,19 +43,9 @@ const answerSchema = z.object({
   transcript: z.string().trim().min(1).max(10000),
   durationMs: z.number().int().positive().max(100 * 60 * 1000).optional(),
   voiceMetrics: z.string().max(4000).optional(),
-  pauseAnalysis: z.string().max(2500).optional()
+  pauseAnalysis: z.string().max(2500).optional(),
+  cameraMetrics: z.string().max(4000).optional()
 }).strict();
-
-function questionsForRole(role?: string) {
-  const target = role || 'this role';
-  return [
-    `Tell me about yourself and your experience relevant to ${target}.`,
-    `What interests you most about ${target}?`,
-    'Describe a difficult problem you solved and how you approached it.',
-    'Tell me about a time you received difficult feedback. How did you respond?',
-    'What questions would you like to ask the interviewer?'
-  ];
-}
 
 async function removeUpload(mediaUrl?: string | null) {
   if (!mediaUrl?.startsWith('/uploads/')) return;
@@ -66,10 +55,7 @@ async function removeUpload(mediaUrl?: string | null) {
 
 /**
  * Loads a session's questions with their answers and analyses using flat
- * one-level includes plus an in-memory join. Three-level nested includes hit
- * a serialization bug in the early Rust-free Prisma client (6.7.0), and this
- * reads identically under the classic engine while costing at most two extra
- * round-trips for a bounded number of questions per session.
+ * one-level includes plus an in-memory join.
  */
 async function loadSessionQuestions(sessionId: string) {
   const questions = await prisma.question.findMany({
@@ -78,11 +64,11 @@ async function loadSessionQuestions(sessionId: string) {
     include: { answer: true }
   });
   const answers = await prisma.answer.findMany({
-    where: { questionId: { in: questions.map((question) => question.id) } },
+    where: { questionId: { in: questions.map((question: any) => question.id) } },
     include: { analyses: true }
   });
-  const byQuestionId = new Map(answers.map((answer) => [answer.questionId, answer]));
-  return questions.map(({ answer: _answer, ...question }) => ({
+  const byQuestionId = new Map(answers.map((answer: any) => [answer.questionId, answer]));
+  return questions.map(({ answer: _answer, ...question }: any) => ({
     ...question,
     answer: byQuestionId.get(question.id) ?? null
   }));
@@ -98,7 +84,6 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res) => {
       report: { select: { overallScore: true } }
     }
   });
-  // Flat queries only — nested includes are unreliable on the Rust-free Prisma client.
   const questions: Array<{ id: string; sessionId: string }> = interviews.length === 0 ? [] : await prisma.question.findMany({
     where: { sessionId: { in: interviews.map((interview: { id: string }) => interview.id) } },
     select: { id: true, sessionId: true }
@@ -116,7 +101,7 @@ router.get('/', requireAuth, async (req: AuthenticatedRequest, res) => {
     answeredBySession.set(sessionId, (answeredBySession.get(sessionId) ?? 0) + 1);
   }
   return res.json({
-    interviews: interviews.map((interview) => ({
+    interviews: interviews.map((interview: any) => ({
       ...interview,
       answeredCount: answeredBySession.get(interview.id) ?? 0
     }))
@@ -129,13 +114,17 @@ router.post('/', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: 'A title of at least 2 characters is required', details: parsed.error.flatten() });
   }
+
+  const { questions, questionSource } = await generateInterviewQuestions(parsed.data.role);
+
   const interview = await prisma.interviewSession.create({
     data: {
       userId: req.userId,
       title: parsed.data.title,
       role: parsed.data.role,
+      questionSource,
       questions: {
-        create: questionsForRole(parsed.data.role).map((text, index) => ({ text, order: index + 1 }))
+        create: questions.map((text, index) => ({ text, order: index + 1 }))
       }
     },
     include: { questions: { orderBy: { order: 'asc' } } }
@@ -190,9 +179,23 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
     }
   }
 
+  let cameraAnalysis: ReturnType<typeof analyzeCameraPresence> | undefined;
+  if (parsed.data.cameraMetrics) {
+    try {
+      const metrics = cameraMetricsSchema.parse(JSON.parse(parsed.data.cameraMetrics));
+      cameraAnalysis = analyzeCameraPresence(metrics);
+    } catch {
+      await removeUpload(newMediaUrl);
+      return res.status(400).json({ error: 'Camera analysis data is invalid' });
+    }
+  }
+
   const question = await prisma.question.findFirst({
     where: { id: parsed.data.questionId, sessionId: req.params.id, session: { userId: req.userId } },
-    include: { answer: { select: { mediaUrl: true } } }
+    include: {
+      answer: { select: { mediaUrl: true } },
+      session: { select: { role: true } }
+    }
   });
   if (!question) {
     await removeUpload(newMediaUrl);
@@ -200,6 +203,8 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
   }
 
   const speechAnalysis = analyzeSpeech(parsed.data.transcript, parsed.data.durationMs, pauseAnalysis);
+  const answerContentAnalysis = await analyzeAnswerContent(question.text, parsed.data.transcript, question.session?.role ?? undefined);
+
   try {
     const result = await prisma.$transaction(async (tx: Pick<typeof prisma, 'answer' | 'analysisResult'>) => {
       const answer = await tx.answer.upsert({
@@ -217,31 +222,55 @@ router.post('/:id/answers', requireAuth, upload.single('media'), async (req: Aut
         }
       });
 
-      await tx.analysisResult.deleteMany({
-        where: { answerId: answer.id, kind: speechAnalysis.category }
-      });
-      const analyses = [await tx.analysisResult.create({
-        data: { answerId: answer.id, kind: speechAnalysis.category, score: speechAnalysis.score, details: { metrics: speechAnalysis.metrics, limitations: speechAnalysis.limitations } }
-      })];
+      // Clear existing analyses for categories we are updating
+      const categoriesToUpdate = [
+        speechAnalysis.category,
+        answerContentAnalysis.category,
+        ...(voiceAnalysis ? [voiceAnalysis.category] : []),
+        ...(cameraAnalysis ? [
+          cameraAnalysis.eyeContact.category,
+          cameraAnalysis.expression.category,
+          cameraAnalysis.posture.category,
+          cameraAnalysis.presence.category
+        ] : [])
+      ];
 
-      if (voiceAnalysis) {
-        await tx.analysisResult.deleteMany({
-          where: { answerId: answer.id, kind: voiceAnalysis.category }
-        });
-        analyses.push(await tx.analysisResult.create({
-          data: { answerId: answer.id, kind: voiceAnalysis.category, score: voiceAnalysis.score, details: { metrics: voiceAnalysis.metrics, limitations: voiceAnalysis.limitations } }
-        }));
-      }
-      return { answer, analyses };
+      await tx.analysisResult.deleteMany({
+        where: { answerId: answer.id, kind: { in: categoriesToUpdate } }
+      });
+
+      const analysesToCreate = [
+        { answerId: answer.id, kind: speechAnalysis.category, score: speechAnalysis.score, details: { metrics: speechAnalysis.metrics, limitations: speechAnalysis.limitations } },
+        { answerId: answer.id, kind: answerContentAnalysis.category, score: answerContentAnalysis.score, details: { metrics: answerContentAnalysis.metrics, limitations: answerContentAnalysis.limitations } },
+        ...(voiceAnalysis ? [{ answerId: answer.id, kind: voiceAnalysis.category, score: voiceAnalysis.score, details: { metrics: voiceAnalysis.metrics, limitations: voiceAnalysis.limitations } }] : []),
+        ...(cameraAnalysis ? [
+          { answerId: answer.id, kind: cameraAnalysis.eyeContact.category, score: cameraAnalysis.eyeContact.score, details: { metrics: cameraAnalysis.eyeContact.metrics, limitations: cameraAnalysis.eyeContact.limitations } },
+          { answerId: answer.id, kind: cameraAnalysis.expression.category, score: cameraAnalysis.expression.score, details: { metrics: cameraAnalysis.expression.metrics, limitations: cameraAnalysis.expression.limitations } },
+          { answerId: answer.id, kind: cameraAnalysis.posture.category, score: cameraAnalysis.posture.score, details: { metrics: cameraAnalysis.posture.metrics, limitations: cameraAnalysis.posture.limitations } },
+          { answerId: answer.id, kind: cameraAnalysis.presence.category, score: cameraAnalysis.presence.score, details: { metrics: cameraAnalysis.presence.metrics, limitations: cameraAnalysis.presence.limitations } }
+        ] : [])
+      ];
+
+      const createdAnalyses = await Promise.all(
+        analysesToCreate.map((data) => tx.analysisResult.create({ data }))
+      );
+
+      return { answer, analyses: createdAnalyses };
     });
 
     if (newMediaUrl && question.answer?.mediaUrl && question.answer.mediaUrl !== newMediaUrl) {
       await removeUpload(question.answer.mediaUrl);
     }
+
+    const scoreBreakdown = calculateAnswerScores(result.analyses.map((a: any) => ({ kind: a.kind, score: a.score })));
+
     return res.json({
       answer: { ...result.answer, mediaUrl: toSignedMediaUrl(result.answer.mediaUrl) },
       speechAnalysis: { ...speechAnalysis, kind: speechAnalysis.category },
+      answerContentAnalysis: { ...answerContentAnalysis, kind: answerContentAnalysis.category },
       voiceAnalysis: voiceAnalysis ? { ...voiceAnalysis, kind: voiceAnalysis.category } : null,
+      cameraAnalysis: cameraAnalysis ? cameraAnalysis.presence : null,
+      scoreBreakdown,
       analysisIds: result.analyses.map((item: { id: string }) => item.id)
     });
   } catch (error) {
@@ -258,7 +287,7 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
   if (!interview) return res.status(404).json({ error: 'Interview not found' });
   const questions = await loadSessionQuestions(interview.id);
 
-  const unanswered = questions.filter((question) => !question.answer);
+  const unanswered = questions.filter((question: any) => !question.answer);
   if (unanswered.length > 0) {
     return res.status(409).json({
       error: 'Answer every question before completing the interview',
@@ -266,19 +295,13 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
     });
   }
 
-  const scores: number[] = questions.flatMap((question) =>
-    question.answer?.analyses.flatMap((analysis) => analysis.score ?? []) ?? []
-  );
-  const overallScore = scores.length > 0
-    ? Math.round(scores.reduce((total, score) => total + score, 0) / scores.length)
-    : null;
+  const overallScore = calculateSessionOverallScore(questions);
 
-  // Narrative feedback: LLM-generated when configured, deterministic offline
-  // summary otherwise (never blocks completing an interview).
-  const digest = questions.map((question) => ({
+  // Digest for narrative feedback report
+  const digest = questions.map((question: any) => ({
     text: question.text,
     transcript: question.answer?.transcript ?? null,
-    analyses: (question.answer?.analyses ?? []).map((analysis) => ({
+    analyses: (question.answer?.analyses ?? []).map((analysis: any) => ({
       kind: analysis.kind,
       score: analysis.score,
       metrics: (analysis.details as { metrics?: Record<string, unknown> } | null)?.metrics ?? null
@@ -287,7 +310,7 @@ router.post('/:id/complete', requireAuth, async (req: AuthenticatedRequest, res)
   const reportSummary = await generateReportSummary(digest, overallScore);
   const reportDetails = {
     answeredQuestions: questions.length,
-    analysisCount: scores.length,
+    analysisCount: questions.reduce((acc: number, q: any) => acc + (q.answer?.analyses?.length ?? 0), 0),
     strengths: reportSummary.strengths,
     improvements: reportSummary.improvements,
     usedLlm: reportSummary.usedLlm
@@ -344,7 +367,7 @@ router.get('/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
   if (!interview) return res.status(404).json({ error: 'Interview not found' });
   const questions = await loadSessionQuestions(interview.id);
   // Media is private: exchange stored upload paths for short-lived signed URLs.
-  const signedQuestions = questions.map((question) => ({
+  const signedQuestions = questions.map((question: any) => ({
     ...question,
     answer: question.answer
       ? { ...question.answer, mediaUrl: toSignedMediaUrl(question.answer.mediaUrl) }

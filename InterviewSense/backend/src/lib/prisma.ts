@@ -12,13 +12,13 @@ export const prisma = new PrismaClient().$extends({
     analysisResult: {
       details: {
         needs: { details: true },
-        compute: ({ details }) => unwrapJsonValue(details) as typeof details
+        compute: ({ details }: { details: any }) => unwrapJsonValue(details) as typeof details
       }
     },
     feedbackReport: {
       details: {
         needs: { details: true },
-        compute: ({ details }) => unwrapJsonValue(details) as typeof details
+        compute: ({ details }: { details: any }) => unwrapJsonValue(details) as typeof details
       }
     }
   }

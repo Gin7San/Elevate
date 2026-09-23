@@ -21,7 +21,8 @@ test('signMediaUrl produces a verifiable URL shape', () => {
 
 test('verifyMediaSignature rejects tampered input', () => {
   const { filename, expiresAt, signature } = parseSigned(signMediaUrl(FILENAME));
-  assert.equal(verifyMediaSignature(filename, expiresAt, signature.replace(/^./, '0')), false);
+  const tamperedSig = (signature[0] === '0' ? '1' : '0') + signature.slice(1);
+  assert.equal(verifyMediaSignature(filename, expiresAt, tamperedSig), false);
   assert.equal(verifyMediaSignature('ff'.repeat(16), expiresAt, signature), false);
   const nowSeconds = Math.floor(Date.now() / 1000);
   assert.equal(verifyMediaSignature(filename, nowSeconds - 10, signature), false);

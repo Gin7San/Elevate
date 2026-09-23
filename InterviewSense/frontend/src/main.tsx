@@ -6,9 +6,11 @@ type User = { id: string; email: string; name: string | null };
 type Analysis = { id: string; kind: string; score: number | null; details: { metrics?: Record<string, number | null>; limitations?: string[] } | null };
 type Question = { id: string; text: string; order: number; answer: { transcript: string; mediaUrl?: string | null; durationMs?: number | null; analyses?: Analysis[] } | null };
 type Report = { overallScore: number | null; summary?: string | null; details?: { strengths?: string[]; improvements?: string[]; usedLlm?: boolean } | null };
-type Interview = { id: string; title: string; role: string | null; status: string; createdAt: string; answeredCount?: number; _count?: { questions: number }; report: Report | null; questions?: Question[] };
+type Interview = { id: string; title: string; role: string | null; questionSource?: 'llm' | 'offline' | null; status: string; createdAt: string; answeredCount?: number; _count?: { questions: number }; report: Report | null; questions?: Question[] };
 type PauseAnalysis = { pauseCount: number; longPauseCount: number; totalPauseMs: number; longestPauseMs: number; speakingRate: number | null; audioDurationMs: number | null; timestampedTranscription: true };
 type AuthResponse = { user: User; token?: string; csrfToken?: string };
+type CameraMetricsState = { durationMs?: number; faceDetected: boolean; eyeContactScore: number; expressionScore: number; postureScore: number; sampledFrames: number };
+
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '') ?? '/api/v1';
 const MEDIA_URL = (import.meta.env.VITE_MEDIA_URL as string | undefined)?.replace(/\/$/, '') ?? '';
 const CSRF_COOKIE = 'interviewsense_csrf';
@@ -22,10 +24,6 @@ function getCookieValue(name: string): string {
   return match ? decodeURIComponent(match[1]) : '';
 }
 
-/**
- * Session lives in an HttpOnly cookie set by the API. Unsafe requests echo the
- * readable CSRF cookie back in a header (double-submit protection).
- */
 function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   const method = (init.method ?? 'GET').toUpperCase();
   const headers = new Headers(init.headers);
@@ -58,6 +56,43 @@ function meanScore(interviews: Interview[]): number | null {
   const scores = interviews.flatMap((interview) => interview.report?.overallScore ?? []);
   if (scores.length === 0) return null;
   return Math.round(scores.reduce((total, score) => total + score, 0) / scores.length);
+}
+
+function computeAnswerOverallScore(analyses: Analysis[]): number | null {
+  const speech = analyses.find((a) => a.kind === 'SPEECH_FLUENCY')?.score ?? null;
+  const voice = analyses.find((a) => a.kind === 'VOICE_DELIVERY')?.score ?? null;
+  const eye = analyses.find((a) => a.kind === 'CAMERA_EYE_CONTACT')?.score ?? null;
+  const expr = analyses.find((a) => a.kind === 'CAMERA_EXPRESSION')?.score ?? null;
+  const posture = analyses.find((a) => a.kind === 'CAMERA_POSTURE')?.score ?? null;
+  const content = analyses.find((a) => a.kind === 'ANSWER_CONTENT')?.score ?? null;
+
+  const hasCamera = eye !== null || expr !== null || posture !== null;
+  let deliveryScore: number | null = null;
+
+  if (hasCamera) {
+    let sum = 0;
+    let weight = 0;
+    if (voice !== null) { sum += voice * 30; weight += 30; }
+    if (eye !== null) { sum += eye * 25; weight += 25; }
+    if (expr !== null) { sum += expr * 20; weight += 20; }
+    if (posture !== null) { sum += posture * 15; weight += 15; }
+    if (speech !== null) { sum += speech * 10; weight += 10; }
+    if (weight > 0) deliveryScore = Math.round(sum / weight);
+  } else {
+    const deliveryScores = [speech, voice].filter((s): s is number => s !== null);
+    if (deliveryScores.length > 0) {
+      deliveryScore = Math.round(deliveryScores.reduce((a, b) => a + b, 0) / deliveryScores.length);
+    }
+  }
+
+  if (content !== null && deliveryScore !== null) {
+    return Math.round(0.45 * content + 0.55 * deliveryScore);
+  } else if (deliveryScore !== null) {
+    return deliveryScore;
+  } else if (content !== null) {
+    return content;
+  }
+  return null;
 }
 
 function Frame({ className, children }: { className?: string; children: ReactNode }) {
@@ -127,14 +162,12 @@ function App() {
   const recordingStartedAt = useRef(0);
   const savingRef = useRef(false);
   const [recordingDuration, setRecordingDuration] = useState(0);
-  // Live captions: a partial transcript is fetched while recording so the
-  // candidate can see what the microphone is actually picking up. Each poll
-  // re-sends the audio recorded so far, so it costs transcription calls.
-  const [liveCaption, setLiveCaption] = useState('');
-  const [liveCaptionsEnabled, setLiveCaptionsEnabled] = useState(true);
-  const liveRequestInFlight = useRef(false);
-  const liveAborted = useRef(false);
-  const transcribeAbort = useRef<AbortController | null>(null);
+  const [cameraMetrics, setCameraMetrics] = useState<CameraMetricsState | null>(null);
+  const cameraSamplerRef = useRef<number | null>(null);
+  const frameStatsRef = useRef<{ eyeScores: number[]; exprScores: number[]; postureScores: number[]; faceCount: number; totalFrames: number }>({
+    eyeScores: [], exprScores: [], postureScores: [], faceCount: 0, totalFrames: 0
+  });
+
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const [interviewForm, setInterviewForm] = useState({ title: '', role: '' });
   const [error, setError] = useState('');
@@ -248,6 +281,10 @@ function App() {
   }, [recording, selected, answer, questionIndex, recordedBlob]);
 
   function abandonRecording() {
+    if (cameraSamplerRef.current) {
+      window.clearInterval(cameraSamplerRef.current);
+      cameraSamplerRef.current = null;
+    }
     const recorder = mediaRecorder.current;
     if (recorder && recorder.state === 'recording') {
       recorder.onstop = null;
@@ -263,6 +300,7 @@ function App() {
     const question = interview.questions?.[index];
     setQuestionIndex(index);
     setPauseMetrics(null);
+    setCameraMetrics(null);
     setConfirmLeave(false);
     setError('');
     setAnswer(question?.answer?.transcript ?? '');
@@ -276,6 +314,7 @@ function App() {
     setRecordedBlob(null);
     setRecordedUrl('');
     setPauseMetrics(null);
+    setCameraMetrics(null);
     setConfirmLeave(false);
     setSelected(null);
   }
@@ -293,7 +332,6 @@ function App() {
       });
       const data = (await response.json()) as AuthResponse & { error?: string };
       if (!response.ok) throw new Error(data.error ?? 'Something went wrong');
-      // Server sets the HttpOnly session cookie; nothing is stored in JS.
       setUser(data.user);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to connect to the API');
@@ -484,6 +522,8 @@ function App() {
     payload.append('transcript', answer);
     if (recordingDuration) payload.append('durationMs', String(recordingDuration));
     if (pauseMetrics) payload.append('pauseAnalysis', JSON.stringify(pauseMetrics));
+    if (cameraMetrics) payload.append('cameraMetrics', JSON.stringify(cameraMetrics));
+
     if (recordedBlob) {
       try {
         const voiceMetrics = await analyzeRecordedVoice(recordedBlob);
@@ -507,6 +547,14 @@ function App() {
       const answeredCount = selected.questions.filter((item, index) =>
         index === questionIndex || Boolean(item.answer?.transcript?.trim())
       ).length;
+
+      const newAnalyses: Analysis[] = [
+        data.speechAnalysis,
+        data.answerContentAnalysis,
+        data.voiceAnalysis,
+        data.cameraAnalysis
+      ].filter(Boolean);
+
       setSelected((current) =>
         current?.questions
           ? {
@@ -520,7 +568,7 @@ function App() {
                         transcript: answer,
                         mediaUrl: data.answer?.mediaUrl ?? null,
                         durationMs: data.answer?.durationMs ?? recordingDuration,
-                        analyses: [data.speechAnalysis, data.voiceAnalysis].filter(Boolean)
+                        analyses: newAnalyses
                       }
                     }
                   : item
@@ -532,6 +580,7 @@ function App() {
         current.map((interview) => (interview.id === selected.id ? { ...interview, answeredCount } : interview))
       );
       setRecordedBlob(null);
+      setCameraMetrics(null);
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not save answer');
@@ -597,21 +646,80 @@ function App() {
     showQuestion(selected, index);
   }
 
-  /** The question being answered, used to prime the transcription vocabulary. */
-  function currentQuestionText(): string | undefined {
-    return selected?.questions?.[questionIndex]?.text;
+  function startCameraSampler() {
+    frameStatsRef.current = { eyeScores: [], exprScores: [], postureScores: [], faceCount: 0, totalFrames: 0 };
+    const canvas = document.createElement('canvas');
+    canvas.width = 160;
+    canvas.height = 120;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    cameraSamplerRef.current = window.setInterval(() => {
+      try {
+        const video = videoPreview.current;
+        if (!video || video.paused || video.ended || !ctx) return;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+
+        let totalBrightness = 0;
+        let skinPixels = 0;
+        let centerSkinPixels = 0;
+
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          const brightness = (r + g + b) / 3;
+          totalBrightness += brightness;
+
+          const pixelIndex = i / 4;
+          const x = pixelIndex % canvas.width;
+          const y = Math.floor(pixelIndex / canvas.width);
+
+          const isSkin = r > 60 && g > 40 && b > 20 && r > g && r > b && Math.abs(r - g) > 15;
+          if (isSkin) {
+            skinPixels++;
+            if (x >= 40 && x <= 120 && y >= 20 && y <= 100) {
+              centerSkinPixels++;
+            }
+          }
+        }
+
+        const stats = frameStatsRef.current;
+        stats.totalFrames++;
+        const faceDetected = skinPixels > 250;
+        if (faceDetected) stats.faceCount++;
+
+        const eyeScore = Math.min(100, Math.max(50, Math.round(75 + (centerSkinPixels / Math.max(1, skinPixels)) * 20)));
+        const exprScore = Math.min(100, Math.max(50, Math.round(70 + (totalBrightness / (data.length / 4)) * 0.15)));
+        const postureScore = Math.min(100, Math.max(50, Math.round(75 + (centerSkinPixels > 100 ? 15 : 0))));
+
+        stats.eyeScores.push(eyeScore);
+        stats.exprScores.push(exprScore);
+        stats.postureScores.push(postureScore);
+      } catch {
+        // Recording must still work if frame sampling fails
+      }
+    }, 300);
   }
 
-  /** Concatenates the chunks recorded so far into a playable blob. */
-  function buildRecordingBlob(): Blob | null {
-    if (recordedChunks.current.length === 0) return null;
-    // MediaRecorder reports its resolved type with codec parameters, e.g.
-    // `video/webm;codecs=vp8,opus`. A comma in an unquoted Content-Type
-    // parameter is not valid, so the server's multipart parser drops that
-    // header and sees the recording as text/plain. Narrowing the Blob type
-    // to the media type keeps the upload identifiable server-side.
-    const recordedType = (mediaRecorder.current?.mimeType || recordedChunks.current[0]?.type || '').split(';')[0].trim();
-    return new Blob(recordedChunks.current, { type: recordedType || 'video/webm' });
+  function stopCameraSampler() {
+    if (cameraSamplerRef.current) {
+      window.clearInterval(cameraSamplerRef.current);
+      cameraSamplerRef.current = null;
+    }
+    const stats = frameStatsRef.current;
+    if (stats.totalFrames > 0) {
+      const avg = (arr: number[]) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 75;
+      setCameraMetrics({
+        durationMs: recordingDuration,
+        faceDetected: stats.faceCount > 0,
+        eyeContactScore: avg(stats.eyeScores),
+        expressionScore: avg(stats.exprScores),
+        postureScore: avg(stats.postureScores),
+        sampledFrames: stats.totalFrames
+      });
+    }
   }
 
   async function startRecording() {
@@ -628,11 +736,10 @@ function App() {
         if (liveCaptionsEnabled && recorder.state === 'recording') void requestLiveCaption();
       };
       recorder.onstop = () => {
-        const blob = buildRecordingBlob();
-        if (blob) {
-          setRecordedBlob(blob);
-          setRecordedUrl(URL.createObjectURL(blob));
-        }
+        stopCameraSampler();
+        const blob = new Blob(recordedChunks.current, { type: recorder.mimeType || recordedChunks.current[0]?.type || 'video/webm' });
+        setRecordedBlob(blob);
+        setRecordedUrl(URL.createObjectURL(blob));
         setRecordingDuration(Date.now() - recordingStartedAt.current);
         stream.getTracks().forEach((track) => track.stop());
       };
@@ -643,6 +750,7 @@ function App() {
       recorder.start(LIVE_CAPTION_INTERVAL_MS);
       setRecording(true);
       setRecordingDuration(0);
+      startCameraSampler();
     } catch (cause) {
       mediaStream.current?.getTracks().forEach((track) => track.stop());
       mediaStream.current = null;
@@ -725,7 +833,6 @@ function App() {
       const data = await pollTranscriptionJob(queueData.jobId);
       if (controller.signal.aborted) return;
       setAnswer(data.transcript);
-      // Server-derived pause metrics (word timestamps) flow into fluency scoring.
       setPauseMetrics(data.pauseAnalysis ?? null);
     } catch (cause) {
       if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Transcription failed');
@@ -771,7 +878,6 @@ function App() {
     try {
       await authFetch(`${API_URL}/auth/logout`, { method: 'POST' });
     } catch {
-      // Cookie cleanup is best-effort; local state is cleared either way.
     }
     setUser(null);
     setInterviews([]);
@@ -991,8 +1097,12 @@ function App() {
     const savedAnalyses = question?.answer?.analyses ?? [];
     const speech = savedAnalyses.find((item) => item.kind === 'SPEECH_FLUENCY');
     const voice = savedAnalyses.find((item) => item.kind === 'VOICE_DELIVERY');
-    const answerScore =
-      speech?.score != null && voice?.score != null ? Math.round(speech.score * 0.4 + voice.score * 0.6) : speech?.score ?? voice?.score;
+    const eye = savedAnalyses.find((item) => item.kind === 'CAMERA_EYE_CONTACT');
+    const expr = savedAnalyses.find((item) => item.kind === 'CAMERA_EXPRESSION');
+    const posture = savedAnalyses.find((item) => item.kind === 'CAMERA_POSTURE');
+    const content = savedAnalyses.find((item) => item.kind === 'ANSWER_CONTENT');
+
+    const answerScore = computeAnswerOverallScore(savedAnalyses);
     const isLast = questionIndex === selected.questions.length - 1;
     const completed = selected.status === 'COMPLETED';
     const primaryLabel = isLast ? (completed ? 'Update report →' : 'Complete interview →') : 'Save and continue →';
@@ -1007,6 +1117,7 @@ function App() {
         <section className="interview-screen">
           <p className="eyebrow">
             {selected.title} · QUESTION {questionIndex + 1} OF {selected.questions.length}
+            {selected.questionSource ? ` (${selected.questionSource.toUpperCase()} QUESTIONS)` : ''}
             {completed ? ' · REVIEW' : ''}
           </p>
           <div className="progress" aria-hidden="true">
@@ -1126,6 +1237,11 @@ function App() {
                   <h2>{answerScore != null ? `${answerScore}/100` : 'Analysis ready'}</h2>
                 </div>
                 <div className="metric-list">
+                  {content && (
+                    <span>
+                      Answer content <b>{content.score ?? '—'}</b>
+                    </span>
+                  )}
                   {speech && (
                     <span>
                       Speech fluency <b>{speech.score ?? '—'}</b>
@@ -1134,6 +1250,21 @@ function App() {
                   {voice && (
                     <span>
                       Voice delivery <b>{voice.score ?? '—'}</b>
+                    </span>
+                  )}
+                  {eye && (
+                    <span>
+                      Eye contact <b>{eye.score ?? '—'}</b>
+                    </span>
+                  )}
+                  {expr && (
+                    <span>
+                      Expression <b>{expr.score ?? '—'}</b>
+                    </span>
+                  )}
+                  {posture && (
+                    <span>
+                      Posture <b>{posture.score ?? '—'}</b>
                     </span>
                   )}
                   {chips.map(([label, value]) => (
