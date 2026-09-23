@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useEffect, useRef, useState } from 'react';
+import { Component, FormEvent, ReactNode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
@@ -95,6 +95,35 @@ function computeAnswerOverallScore(analyses: Analysis[]): number | null {
   return null;
 }
 
+class AppErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('The app encountered a rendering error:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <main className="shell recovery-screen" role="alert">
+          <header className="topbar"><strong>InterviewSense</strong></header>
+          <section>
+            <p className="eyebrow">WE HIT A PROBLEM</p>
+            <h1>Let’s get you<br /><em>back on track.</em></h1>
+            <p className="lede">This screen could not be loaded. Your saved interview answers are still on your account.</p>
+            <button type="button" onClick={() => window.location.assign(window.location.pathname)}>Return to dashboard</button>
+          </section>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function Frame({ className, children }: { className?: string; children: ReactNode }) {
   return (
     <>
@@ -161,6 +190,11 @@ function App() {
   const recordedChunks = useRef<Blob[]>([]);
   const recordingStartedAt = useRef(0);
   const savingRef = useRef(false);
+  const liveAborted = useRef(true);
+  const liveRequestInFlight = useRef(false);
+  const transcribeAbort = useRef<AbortController | null>(null);
+  const [liveCaptionsEnabled, setLiveCaptionsEnabled] = useState(false);
+  const [liveCaption, setLiveCaption] = useState('');
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [cameraMetrics, setCameraMetrics] = useState<CameraMetricsState | null>(null);
   const cameraSamplerRef = useRef<number | null>(null);
@@ -421,9 +455,16 @@ function App() {
         setError(data.error ?? 'Could not load interview');
         return;
       }
-      const loaded = data.interview as Interview;
-      const start = startAt ?? (loaded.status === 'COMPLETED' ? 0 : firstUnansweredIndex(loaded.questions ?? []));
-      const answeredCount = (loaded.questions ?? []).filter((item) => item.answer?.transcript?.trim()).length;
+      const loaded = data.interview as Interview | undefined;
+      if (!loaded || !Array.isArray(loaded.questions) || loaded.questions.length === 0) {
+        setError('This interview has no questions to resume. Refresh your dashboard or start a new session.');
+        return;
+      }
+      const start = Math.max(0, Math.min(
+        startAt ?? (loaded.status === 'COMPLETED' ? 0 : firstUnansweredIndex(loaded.questions)),
+        loaded.questions.length - 1
+      ));
+      const answeredCount = loaded.questions.filter((item) => item.answer?.transcript?.trim()).length;
       abandonRecording();
       setSelected(loaded);
       setInterviews((current) => current.map((item) => (
@@ -720,6 +761,16 @@ function App() {
         sampledFrames: stats.totalFrames
       });
     }
+  }
+
+  function currentQuestionText(): string {
+    return selected?.questions?.[questionIndex]?.text ?? '';
+  }
+
+  function buildRecordingBlob(): Blob | null {
+    if (recordedChunks.current.length === 0) return null;
+    const type = mediaRecorder.current?.mimeType || recordedChunks.current[0]?.type || 'video/webm';
+    return new Blob(recordedChunks.current, { type });
   }
 
   async function startRecording() {
@@ -1093,7 +1144,9 @@ function App() {
   }
 
   if (selected?.questions?.length) {
-    const question = selected.questions[questionIndex];
+    // Keep rendering resilient if a session's saved question count changed between loads.
+    const activeQuestionIndex = Math.max(0, Math.min(questionIndex, selected.questions.length - 1));
+    const question = selected.questions[activeQuestionIndex];
     const savedAnalyses = question?.answer?.analyses ?? [];
     const speech = savedAnalyses.find((item) => item.kind === 'SPEECH_FLUENCY');
     const voice = savedAnalyses.find((item) => item.kind === 'VOICE_DELIVERY');
@@ -1103,7 +1156,7 @@ function App() {
     const content = savedAnalyses.find((item) => item.kind === 'ANSWER_CONTENT');
 
     const answerScore = computeAnswerOverallScore(savedAnalyses);
-    const isLast = questionIndex === selected.questions.length - 1;
+    const isLast = activeQuestionIndex === selected.questions.length - 1;
     const completed = selected.status === 'COMPLETED';
     const primaryLabel = isLast ? (completed ? 'Update report →' : 'Complete interview →') : 'Save and continue →';
     return (
@@ -1116,21 +1169,21 @@ function App() {
         </header>
         <section className="interview-screen">
           <p className="eyebrow">
-            {selected.title} · QUESTION {questionIndex + 1} OF {selected.questions.length}
+            {selected.title} · QUESTION {activeQuestionIndex + 1} OF {selected.questions.length}
             {selected.questionSource ? ` (${selected.questionSource.toUpperCase()} QUESTIONS)` : ''}
             {completed ? ' · REVIEW' : ''}
           </p>
           <div className="progress" aria-hidden="true">
-            <span style={{ width: `${((questionIndex + 1) / selected.questions.length) * 100}%` }} />
+            <span style={{ width: `${((activeQuestionIndex + 1) / selected.questions.length) * 100}%` }} />
           </div>
           <nav className="question-nav" aria-label="Questions">
             {selected.questions.map((item, index) => (
               <button
                 key={item.id}
                 type="button"
-                className={`question-dot plain-button${index === questionIndex ? ' current' : ''}${item.answer?.transcript?.trim() ? ' answered' : ''}`}
+                className={`question-dot plain-button${index === activeQuestionIndex ? ' current' : ''}${item.answer?.transcript?.trim() ? ' answered' : ''}`}
                 aria-label={`Question ${index + 1}${item.answer?.transcript?.trim() ? ', answered' : ''}`}
-                aria-current={index === questionIndex ? 'step' : undefined}
+                aria-current={index === activeQuestionIndex ? 'step' : undefined}
                 disabled={saving}
                 onClick={() => goToQuestion(index)}
               >
@@ -1292,8 +1345,8 @@ function App() {
           )}
           <div className="interview-actions">
             <div className="action-group">
-              {questionIndex > 0 && (
-                <button type="button" className="text-button" onClick={() => goToQuestion(questionIndex - 1)} disabled={saving}>
+              {activeQuestionIndex > 0 && (
+                <button type="button" className="text-button" onClick={() => goToQuestion(activeQuestionIndex - 1)} disabled={saving}>
                   ← Previous
                 </button>
               )}
@@ -1449,4 +1502,6 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  <AppErrorBoundary><App /></AppErrorBoundary>
+);

@@ -68,3 +68,7 @@ button.plain-button.question-dot:disabled{opacity:.5;cursor:wait}
 @media(prefers-reduced-motion:reduce){
   .progress span,.record-button.stop{animation:none;transition:none}
 }
+.recovery-screen{min-height:100vh}
+.recovery-screen section{max-width:680px;margin:clamp(48px,12vh,120px) auto}
+.recovery-screen h1{font-size:clamp(48px,6vw,78px)}
+.recovery-screen button{margin-top:12px}
