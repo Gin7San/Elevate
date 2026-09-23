@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
+import http from 'node:http';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -339,4 +340,115 @@ test('transcription endpoint guards auth and configuration', async () => {
   form.set('media', new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3])], { type: 'video/webm' }), 'a.webm');
   const notConfigured = await api('/api/v1/transcription', { form, jar, csrf: true });
   assert.equal(notConfigured.status, 503);
+});
+
+test('transcription accepts a browser-style MediaRecorder content type', async () => {
+  const jar = makeJar();
+  await api('/api/v1/auth/login', { json: { email: EMAIL, password: 'E2eNewPass123' }, jar });
+
+  // Chrome reports its MediaRecorder type as `video/webm;codecs=vp8,opus`. The
+  // comma in that unquoted parameter value makes the part header unparseable,
+  // so busboy hands the server `text/plain`; the recording has to be accepted
+  // on its bytes instead of being rejected as an invalid upload.
+  const codecForm = new FormData();
+  codecForm.set('media', new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3])], { type: 'video/webm;codecs=vp8,opus' }), 'answer.webm');
+  const withCodecs = await api('/api/v1/transcription', { form: codecForm, jar, csrf: true });
+  assert.equal(withCodecs.status, 503, 'the codec-parametered recording reaches transcription rather than the upload filter');
+
+  const textForm = new FormData();
+  textForm.set('media', new Blob([new TextEncoder().encode('just text, not a recording')], { type: 'text/plain' }), 'notes.txt');
+  const notMedia = await api('/api/v1/transcription', { form: textForm, jar, csrf: true });
+  assert.equal(notMedia.status, 415, 'content that is not a recording is still refused');
+});
+
+test('transcription jobs: queue, poll, owner scope, and rate limiting', async (t) => {
+  const jar = makeJar();
+  await api('/api/v1/auth/login', { json: { email: EMAIL, password: 'E2eNewPass123' }, jar });
+
+  const form = () => {
+    const payload = new FormData();
+    payload.set('media', new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4])], { type: 'video/webm' }), 'answer.webm');
+    payload.set('prompt', 'Tell me about a difficult problem you solved.');
+    return payload;
+  };
+
+  await t.test('a job is queued, then reports the failure when no engine is configured', async () => {
+    const queued = await api('/api/v1/transcription/jobs', { form: form(), jar, csrf: true });
+    assert.equal(queued.status, 202);
+    assert.ok(queued.body?.jobId, 'a job id is returned');
+
+    // The worker runs asynchronously; poll until it settles.
+    let polled = await api(`/api/v1/transcription/jobs/${queued.body!.jobId}`, { jar });
+    for (let attempt = 0; attempt < 50 && polled.body?.state !== 'failed' && polled.body?.state !== 'completed'; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      polled = await api(`/api/v1/transcription/jobs/${queued.body!.jobId}`, { jar });
+    }
+    assert.equal(polled.body?.state, 'failed');
+    assert.match(String(polled.body?.error), /OPENAI_API_KEY/);
+  });
+
+  await t.test('an unknown or foreign job id is not found', async () => {
+    const missing = await api('/api/v1/transcription/jobs/00000000-0000-4000-8000-000000000000', { jar });
+    assert.equal(missing.status, 404);
+    const anonymous = await api('/api/v1/transcription/jobs/anything', {});
+    assert.equal(anonymous.status, 401, 'polling requires authentication');
+  });
+
+  await t.test('the endpoint is rate limited per user', async () => {
+    process.env.TRANSCRIPTION_RATE_LIMIT_MAX = '2';
+    try {
+      const first = await api('/api/v1/transcription', { form: form(), jar, csrf: true });
+      const second = await api('/api/v1/transcription', { form: form(), jar, csrf: true });
+      const third = await api('/api/v1/transcription', { form: form(), jar, csrf: true });
+      assert.equal(first.status, 503, 'within budget the request reaches the engine');
+      assert.equal(second.status, 503);
+      assert.equal(third.status, 429, 'the third request in the window is refused');
+      assert.ok(third.res.headers.get('retry-after'), 'a Retry-After header is sent');
+    } finally {
+      delete process.env.TRANSCRIPTION_RATE_LIMIT_MAX;
+    }
+  });
+});
+
+test('transcription uses an OpenAI-compatible endpoint when OPENAI_BASE_URL is set', async () => {
+  const requests: string[] = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      requests.push(`${req.method} ${req.url} ${Buffer.concat(chunks).toString('latin1')}`);
+      const body = JSON.stringify({
+        task: 'transcribe', language: 'english', duration: 2, text: 'I shipped it',
+        words: [{ word: 'I', start: 0, end: 0.3 }, { word: 'shipped', start: 0.3, end: 0.7 }, { word: 'it', start: 0.7, end: 1 }]
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+      res.end(body);
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const { port } = upstream.address() as AddressInfo;
+
+  process.env.OPENAI_API_KEY = 'e2e-key';
+  process.env.OPENAI_BASE_URL = `http://127.0.0.1:${port}/v1`;
+  try {
+    const jar = makeJar();
+    await api('/api/v1/auth/login', { json: { email: EMAIL, password: 'E2eNewPass123' }, jar });
+
+    const form = new FormData();
+    form.set('media', new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4])], { type: 'video/webm' }), 'answer.webm');
+    form.set('prompt', 'Tell me about a difficult problem you solved.');
+    const done = await api('/api/v1/transcription', { form, jar, csrf: true });
+
+    assert.equal(done.status, 200);
+    assert.equal(done.body?.transcript, 'I shipped it');
+    assert.equal(done.body?.provider, 'openai');
+    assert.equal((done.body?.pauseAnalysis as { timestampedTranscription?: boolean })?.timestampedTranscription, true);
+    assert.equal(requests.length, 1, 'the configured base URL was called');
+    assert.match(requests[0], /POST \/v1\/audio\/transcriptions/);
+    assert.match(requests[0], /Tell me about a difficult problem you solved\./, 'the question primes the transcription');
+  } finally {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_BASE_URL;
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
 });
